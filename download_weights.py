@@ -1,8 +1,10 @@
-"""Download and cache DeepSeek-V4-Flash NVFP4 weights into a Modal Volume.
+"""Download and cache DeepSeek-V4-Flash weights into a Modal Volume.
 
-This script only downloads weights -- it never requests a GPU. The HF cache
-lives in the Modal Volume ``huggingface-cache`` so later serving apps can mount
-it instead of re-downloading from the Hub.
+The DeepSeek MXFP4 base release is cached -- its ``inference/`` reference code
+is what the pure-PyTorch runner executes. This script only downloads weights --
+it never requests a GPU. The HF cache lives in the Modal Volume
+``huggingface-cache`` so later serving apps can mount it instead of
+re-downloading from the Hub.
 
 Prerequisites:
     modal setup
@@ -27,7 +29,7 @@ hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=Tru
 hf_secret = modal.Secret.from_name("huggingface-secret")
 
 MODELS = {
-    "nvidia/DeepSeek-V4-Flash-0731-NVFP4": "f1caa71142bd0be02f728c79f75042ac1e461579",
+    "deepseek-ai/DeepSeek-V4-Flash-0731": "9e165c30e2704aec5d9d593cce3eebd58bbef1cb",
 }
 
 image = (
