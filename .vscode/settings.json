@@ -1,4 +1,7 @@
 {
   "python-envs.defaultEnvManager": "ms-python.python:pyenv",
-  "cmake.sourceDirectory": "/home/brandon/dev/deepseekv4flash-serving/vllm"
+  "cmake.sourceDirectory": "/home/brandon/dev/deepseekv4flash-serving/vllm",
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportMissingImports": "none"
+  }
 }
