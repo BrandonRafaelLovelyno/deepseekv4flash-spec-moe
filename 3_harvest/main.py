@@ -29,26 +29,42 @@ Payload. The residual states are stored as ``float8_e4m3fn`` with a per-tensor
 scale (recorded in the sidecar); expert ids are ``uint8`` and weights ``float16``,
 so a slice costs ~0.88 MB/token instead of ~1.76 MB/token.
 
-Pipeline (``modal run harvest.py``):
+Pipeline (``modal run 3_harvest/main.py``):
     1. ``convert_ckpt`` (CPU, idempotent) reuses the converted MXFP4 checkpoint
-       under the ``/ckpt`` volume (same artifact ``run_inference.py`` produces).
+       under the ``/ckpt`` volume (same artifact ``inference/main.py`` produces).
     2. ``harvest_all`` (single B300) loads the model once and harvests every
        selected slice, writing one safetensors file plus JSON sidecar per slice
        under ``/harvest/<dataset_id>/<split>/`` and a corpus ``manifest.json``.
 
 Prerequisites:
     modal secret create huggingface-secret HF_TOKEN=hf_...
-    modal run download_weights.py          # caches the MXFP4 base in the volume
-    modal run data_check/data_check.py     # fills the encoded volume
+    modal run 1_weight_download/main.py    # caches the MXFP4 base in the volume
+    modal run 2_data_check/main.py         # fills the encoded volume
 """
 
 import json
 import os
-import random
 import sys
-import time
 
 import modal
+
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if THIS_DIR not in sys.path:
+    sys.path.insert(0, THIS_DIR)
+
+from helper import (  # noqa: E402  (import path set up above)
+    TEST_SESSIONS,
+    TEST_TOKENS,
+    TRAIN_SESSIONS,
+    TRAIN_TOKENS,
+    _harvest_forward,
+    _install_capture,
+    _load_streaming,
+    _quantize_fp8,
+    _read_sessions,
+    _select_slices,
+    _token_labels,
+)
 
 APP_NAME = "deepseek-v4-flash-harvest"
 
@@ -67,23 +83,7 @@ MODEL_PARALLEL = 1
 
 GPU = "B300"
 MAX_SEQ_LEN = 32768
-
-# Four encoded DeepSeek-V4-Flash corpora, as written by data_check.py.
-DATASETS = ("yi30-think", "yi30-nothink", "terminus2", "dsh")
-
-TRAIN_SESSIONS = 4
-TRAIN_TOKENS = 24000
-TEST_SESSIONS = 2
-TEST_TOKENS = 5000
 SEED = 33377335
-
-# Region markers in the encoded prompt (fullwidth vertical bars, U+FF5C).
-# ``<think>``/``</think>`` directly after ``<｜Assistant｜>`` is generation
-# scaffolding (thinking vs chat mode), not model output, so it is not decode.
-MARK_ASSISTANT = "<｜Assistant｜>"
-MARK_END = "<｜end▁of▁sentence｜>"
-MARK_THINK_OPEN = "<think>"
-MARK_THINK_CLOSE = "</think>"
 
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 ckpt_vol = modal.Volume.from_name("deepseek-v4-flash-ckpt", create_if_missing=True)
@@ -96,7 +96,7 @@ harvest_vol = modal.Volume.from_name(
 )
 hf_secret = modal.Secret.from_name("huggingface-secret")
 
-# Same CUDA *devel* base as ``run_inference.py``: TileLang JIT and
+# Same CUDA *devel* base as ``inference/main.py``: TileLang JIT and
 # fast_hadamard_transform both need nvcc, and B300 (sm_103) needs CUDA 13.
 image = (
     modal.Image.from_registry(
@@ -131,6 +131,7 @@ image = (
             "FAST_HADAMARD_TRANSFORM_FORCE_BUILD": "TRUE",
         },
     )
+    .add_local_python_source("helper")
     .env(
         {
             "HF_HUB_CACHE": HF_CACHE_DIR,
@@ -143,246 +144,6 @@ image = (
 app = modal.App(APP_NAME, image=image)
 
 
-def _load_streaming(model, path: str) -> None:
-    """Copy a safetensors checkpoint into ``model`` one tensor at a time.
-
-    ``safetensors.torch.load_model`` would materialize the whole 167 GB file in
-    host RAM before the copy. Streaming sends each tensor straight to the GPU and
-    writes it into the matching parameter storage.
-    """
-    import torch
-    from safetensors import safe_open
-
-    state = model.state_dict()
-    loaded = 0
-    skipped = 0
-    with safe_open(path, framework="pt", device="cuda") as handle:
-        for name in handle.keys():
-            if name not in state:
-                skipped += 1
-                continue
-            tensor = handle.get_tensor(name)
-            target = state[name]
-            if tuple(tensor.shape) != tuple(target.shape):
-                print(
-                    f"shape mismatch, skipping {name}: "
-                    f"{tuple(tensor.shape)} vs {tuple(target.shape)}"
-                )
-                skipped += 1
-                del tensor
-                continue
-            with torch.no_grad():
-                target.copy_(tensor)
-            del tensor
-            loaded += 1
-    print(f"loaded {loaded} tensors, skipped {skipped}")
-
-
-def _install_capture(model, buffers, torch) -> None:
-    """Monkeypatch the 43 blocks to stream routing data into ``buffers``.
-
-    Each wrapper casts the captured tensor to its storage dtype and copies it to
-    its host buffer immediately, so GPU steady-state is one layer rather than
-    all 43.
-
-    Installed once, before the slice loop. The wrappers close over the ``buffers``
-    dict object, so each slice retargets capture by replacing that dict's values
-    -- re-wrapping per slice would nest the wrappers and mismatch token counts.
-    """
-
-    def wrap_block(block, layer):
-        original = block.forward
-
-        def forward(x, start_pos, input_ids, *args):
-            # x: [1, S, hc_mult, dim] -- expanded residual (Hyper-Connections).
-            buffers["expanded"][:, layer].copy_(x[0].to(torch.bfloat16))
-            return original(x, start_pos, input_ids, *args)
-
-        return forward
-
-    def wrap_moe(block, layer):
-        original = block.ffn.forward
-
-        def forward(x, input_ids):
-            # x: [1, S, dim] -- exact router input (post-ffn_norm residual).
-            flat = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
-            buffers["compressed"][:, layer].copy_(flat.to(torch.bfloat16))
-            return original(x, input_ids)
-
-        return forward
-
-    def wrap_gate(block, layer):
-        original = block.ffn.gate.forward
-
-        def forward(x, input_ids=None):
-            weights, indices = original(x, input_ids)
-            buffers["topk_weights"][:, layer].copy_(
-                weights.detach().to(torch.float16)
-            )
-            buffers["topk_ids"][:, layer].copy_(indices.detach().to(torch.uint8))
-            return weights, indices
-
-        return forward
-
-    for layer, block in enumerate(model.layers):
-        block.forward = wrap_block(block, layer)
-        block.ffn.forward = wrap_moe(block, layer)
-        block.ffn.gate.forward = wrap_gate(block, layer)
-
-
-def _harvest_forward(model, input_ids, torch):
-    """Prefill the whole sequence and stop after the last block.
-
-    Deliberately omits ``hc_head``, the LM head, sampling and the DSpark/MTP
-    draft blocks, so nothing is decoded.
-    """
-    with torch.inference_mode():
-        h = model.embed(input_ids)
-        h = h.unsqueeze(2).repeat(1, 1, model.hc_mult, 1)
-        n_layers = len(model.layers)
-        for i, layer in enumerate(model.layers):
-            h = layer(h, 0, input_ids)
-            print(f"  layer {i + 1}/{n_layers}", flush=True)
-    return h
-
-
-def _token_labels(text: str, offsets):
-    """Label tokens as decode (1) or prefill (0), with turn/phase positions.
-
-    A token is decode if it lies in an assistant turn: from after the
-    ``<｜Assistant｜>`` marker (skipping an optional leading ``<think>`` or
-    ``</think>`` generation marker) through the next
-    ``<｜end▁of▁sentence｜>`` inclusive. Everything else is prefill.
-
-    ``offsets`` are the tokenizer's ``(char_start, char_end)`` pairs. Returns
-    ``(is_decode, turn_index, token_idx, phase_index)`` where a *phase* is a
-    maximal contiguous run of equal ``is_decode``: ``token_idx`` is the position
-    within the current phase (0-based, resets at every phase boundary) and
-    ``phase_index`` is the global phase ordinal.
-    """
-    ranges = []
-    turns = []
-    i = 0
-    while True:
-        start = text.find(MARK_ASSISTANT, i)
-        if start < 0:
-            break
-        body = start + len(MARK_ASSISTANT)
-        if text.startswith(MARK_THINK_OPEN, body):
-            body += len(MARK_THINK_OPEN)
-        elif text.startswith(MARK_THINK_CLOSE, body):
-            body += len(MARK_THINK_CLOSE)
-        end = text.find(MARK_END, body)
-        end = end + len(MARK_END) if end >= 0 else len(text)
-        ranges.append((body, end))
-        turns.append(start)
-        i = end
-
-    is_decode = [0] * len(offsets)
-    turn_index = [0] * len(offsets)
-    ti = 0
-    for k, (char_start, _) in enumerate(offsets):
-        while ti < len(turns) and turns[ti] <= char_start:
-            ti += 1
-        turn_index[k] = ti
-        for range_start, range_end in ranges:
-            if range_start <= char_start < range_end:
-                is_decode[k] = 1
-                break
-
-    token_idx = [0] * len(offsets)
-    phase_index = [0] * len(offsets)
-    phase = -1
-    idx = 0
-    prev = None
-    for k, dec in enumerate(is_decode):
-        if dec != prev:
-            phase += 1
-            idx = 0
-            prev = dec
-        token_idx[k] = idx
-        phase_index[k] = phase
-        idx += 1
-    return is_decode, turn_index, token_idx, phase_index
-
-
-def _quantize_fp8(tensor, torch):
-    """Scale a bf16 tensor into e4m3 and return (fp8_tensor, scale)."""
-    absmax = max(tensor.max().item(), -tensor.min().item())
-    scale = max(absmax / 448.0, 1e-8)
-    tensor.div_(scale)
-    return tensor.to(torch.float8_e4m3fn), scale
-
-
-def _read_sessions(encoded_dir: str) -> dict:
-    """List every encoded prompt, grouped by dataset_id."""
-    sessions = {}
-    for dataset in DATASETS:
-        directory = os.path.join(encoded_dir, dataset)
-        if not os.path.isdir(directory):
-            print(f"warning: no encoded prompts for {dataset} ({directory})")
-            sessions[dataset] = []
-            continue
-        keys = sorted(f[: -len(".txt")] for f in os.listdir(directory) if f.endswith(".txt"))
-        sessions[dataset] = [
-            {
-                "dataset_id": dataset,
-                "document_id": key,
-                "path": os.path.join(directory, f"{key}.txt"),
-            }
-            for key in keys
-        ]
-        print(f"{dataset}: {len(keys)} encoded sessions")
-    return sessions
-
-
-def _select_slices(sessions: dict, tokenizer, rng: random.Random) -> dict:
-    """Choose 4 train + 2 test sessions per dataset, preferring long ones.
-
-    Each entry is ``(session, split, n_tokens)`` with ``n_tokens`` the prefix
-    length actually harvested.
-    """
-    plan = {}
-    for dataset, items in sessions.items():
-        for item in items:
-            with open(item["path"], encoding="utf-8") as handle:
-                item["text"] = handle.read()
-            item["n"] = len(
-                tokenizer(item["text"], add_special_tokens=False)["input_ids"]
-            )
-
-        train_pool = [s for s in items if s["n"] >= TRAIN_TOKENS]
-        rng.shuffle(train_pool)
-        train = train_pool[:TRAIN_SESSIONS]
-        if len(train) < TRAIN_SESSIONS:
-            rest = sorted(
-                (s for s in items if s not in train), key=lambda s: -s["n"]
-            )
-            train += rest[: TRAIN_SESSIONS - len(train)]
-
-        chosen = {s["document_id"] for s in train}
-        test_pool = [
-            s for s in items if s["document_id"] not in chosen and s["n"] >= TEST_TOKENS
-        ]
-        rng.shuffle(test_pool)
-        test = test_pool[:TEST_SESSIONS]
-        if len(test) < TEST_SESSIONS:
-            rest = sorted(
-                (s for s in items if s["document_id"] not in chosen and s not in test),
-                key=lambda s: -s["n"],
-            )
-            test += rest[: TEST_SESSIONS - len(test)]
-
-        slices = [(s, "train", min(TRAIN_TOKENS, s["n"])) for s in train]
-        slices += [(s, "test", min(TEST_TOKENS, s["n"])) for s in test]
-        plan[dataset] = slices
-        picked = ", ".join(
-            f"{s['document_id']}({tag},{n})" for s, tag, n in slices
-        )
-        print(f"{dataset}: {picked}")
-    return plan
-
-
 @app.function(
     volumes={HF_CACHE_DIR: hf_cache_vol, CKPT_DIR: ckpt_vol},
     secrets=[hf_secret],
@@ -392,9 +153,7 @@ def _select_slices(sessions: dict, tokenizer, rng: random.Random) -> dict:
 )
 def convert_ckpt(force: bool = False) -> str:
     """Convert the HF checkpoint into DeepSeek's MP-reference format."""
-    import os
     import subprocess
-    import sys
 
     from huggingface_hub import snapshot_download
 
@@ -444,10 +203,7 @@ def convert_ckpt(force: bool = False) -> str:
 )
 def harvest_all(max_seq_len: int = MAX_SEQ_LEN, seed: int = SEED) -> dict:
     """Load the model once and harvest every selected slice."""
-    import json
-    import os
     import random
-    import sys
     import time
 
     from huggingface_hub import snapshot_download
@@ -459,7 +215,7 @@ def harvest_all(max_seq_len: int = MAX_SEQ_LEN, seed: int = SEED) -> dict:
     except Exception as exc:
         raise RuntimeError(
             f"{BASE_REPO} @ {BASE_REV} is not cached in the mounted volume; "
-            "run `modal run download_weights.py` first."
+            "run `modal run 1_weight_download/main.py` first."
         ) from exc
     for sub in ("inference", "encoding"):
         path = os.path.join(snapshot, sub)
@@ -503,7 +259,10 @@ def harvest_all(max_seq_len: int = MAX_SEQ_LEN, seed: int = SEED) -> dict:
     errors = []
 
     for dataset, slices in plan.items():
-        for session, split, n_tokens in slices:
+        for plan_slice in slices:
+            session = plan_slice.session
+            split = plan_slice.split
+            n_tokens = plan_slice.n_tokens
             if n_tokens <= 0:
                 continue
             try:
