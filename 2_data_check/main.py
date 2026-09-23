@@ -89,13 +89,13 @@ hf_secret = modal.Secret.from_name("huggingface-secret")
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("huggingface_hub[hf_xet]")
-    .add_local_python_source("helper")
     .env(
         {
             "HF_HOME": DATASET_DIR,
             "HF_XET_HIGH_PERFORMANCE": "1",
         }
     )
+    .add_local_python_source("helper")
 )
 
 app = modal.App(APP_NAME, image=image)

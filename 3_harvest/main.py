@@ -131,7 +131,6 @@ image = (
             "FAST_HADAMARD_TRANSFORM_FORCE_BUILD": "TRUE",
         },
     )
-    .add_local_python_source("helper")
     .env(
         {
             "HF_HUB_CACHE": HF_CACHE_DIR,
@@ -139,6 +138,7 @@ image = (
             "TILELANG_CACHE_DIR": TILELANG_CACHE_DIR,
         }
     )
+    .add_local_python_source("helper")
 )
 
 app = modal.App(APP_NAME, image=image)
