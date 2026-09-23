@@ -11,6 +11,7 @@ demanded experts. Train and test are independent; replay is capped at
 Artifacts (in ``<run>/prefill_miss/``):
     * ``distributions.csv``              -- split,batch,policy,ratio,missing,portion
     * ``05_static_vs_cached_prefill.png`` -- 4x5 grid per split, static vs cached
+    * ``09_prefill_cdf.png``             -- same grids as CDFs (P(missing <= m))
     * ``10_cache_traffic.png``           -- loads/evictions vs B, per split
     * ``summary.json``, ``run.log``
 """
@@ -34,6 +35,7 @@ from helper import (
     AnalysisContext,
     Curves,
     Event,
+    _cdf,
     _compare_grid_figure,
     _dist_stats,
     _emit,
@@ -87,6 +89,7 @@ def _prefill_cache_batches(
 
     layer_axis = np.arange(n_layers)
     layer_index = np.arange(n_layers)[None, :, None]
+    masks_stack = np.stack([masks[ratio] for ratio in RATIOS])  # [R, L, E]
     out: dict[tuple[str, int], CacheCurves] = {}
     traffic: dict[str, dict[int, dict]] = {}
     for split in SPLITS:
@@ -117,11 +120,11 @@ def _prefill_cache_batches(
                 event_ids = np.concatenate(jobs, axis=0)
                 demand = np.zeros((n_layers, n_experts), dtype=bool)
                 demand[layer_index, event_ids] = True
-                for ratio in RATIOS:
-                    static_miss = (demand & ~masks[ratio]).sum(axis=1)
-                    cached_miss = cache.observe_mask(ratio, demand)
-                    hist_static[ratio][layer_axis, static_miss] += 1
-                    hist_cached[ratio][layer_axis, cached_miss] += 1
+                static_miss = (demand[None, :, :] & ~masks_stack).sum(axis=2)  # [R, L]
+                cached_miss = cache.observe_mask_all(demand)  # [R, L]
+                for ri, ratio in enumerate(RATIOS):
+                    hist_static[ratio][layer_axis, static_miss[ri]] += 1
+                    hist_cached[ratio][layer_axis, cached_miss[ri]] += 1
                 n_events += 1
                 tokens_used += event_tokens
                 if tokens_used >= PREFILL_TOKEN_BUDGET:
@@ -144,7 +147,7 @@ def _prefill_cache_batches(
 
 
 def _fig_prefill_cache(out, k_by_ratio, n_experts: int, split: str) -> bytes:
-    """Figure 09: 4x5 grid of per-batch static vs cached curves for one split."""
+    """Figure 05: 4x5 grid of per-batch static vs cached curves for one split."""
     import numpy as np
 
     panels = [
@@ -162,6 +165,31 @@ def _fig_prefill_cache(out, k_by_ratio, n_experts: int, split: str) -> bytes:
         "portion of prefill events",
         f"Concurrent prefill ({split}): static vs adaptive cache, "
         "unique missing experts per layer, x capped at 256-k",
+    )
+
+
+def _fig_prefill_cdf(out, k_by_ratio, n_experts: int, split: str) -> bytes:
+    """Figure 09: CDF (``P(missing <= m)``) of the per-batch prefill curves."""
+    import numpy as np
+
+    def to_cdf(curves: Curves) -> Curves:
+        return {ratio: _cdf(curves[ratio]) for ratio in RATIOS}
+
+    panels = [
+        (
+            f"batch B={batch}",
+            to_cdf(out[(split, batch)]["static"]),
+            to_cdf(out[(split, batch)]["cached"]),
+            {ratio: np.arange(n_experts - k_by_ratio[ratio] + 1) for ratio in RATIOS},
+            None,
+        )
+        for batch in BATCH_SIZES
+    ]
+    return _compare_grid_figure(
+        panels,
+        "portion of prefill events (CDF)",
+        f"Concurrent prefill ({split}) CDF: static vs adaptive cache, x capped at 256-k",
+        xlabel="missing experts (<= m)",
     )
 
 
@@ -246,6 +274,12 @@ class PrefillMissAnalysis(Analysis):
                     if split == SPLITS[0]
                     else f"{self.name}/05_static_vs_cached_prefill_{split}.png",
                     _fig_prefill_cache(out, ctx.k_by_ratio, ctx.n_experts, split),
+                )
+                yield _image_event(
+                    f"{self.name}/09_prefill_cdf.png"
+                    if split == SPLITS[0]
+                    else f"{self.name}/09_prefill_cdf_{split}.png",
+                    _fig_prefill_cdf(out, ctx.k_by_ratio, ctx.n_experts, split),
                 )
         yield _image_event(
             f"{self.name}/10_cache_traffic.png", _fig_traffic(traffic)

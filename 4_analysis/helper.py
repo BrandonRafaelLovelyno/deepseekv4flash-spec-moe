@@ -268,6 +268,13 @@ def _dist_stats(distribution: Any) -> DistStats:
     }
 
 
+def _cdf(curve: Any) -> "np.ndarray":
+    """Cumulative distribution ``P(missing <= m)`` of a portion curve."""
+    import numpy as np
+
+    return np.cumsum(np.asarray(curve, dtype=np.float64))
+
+
 def _pyplot():
     """Return ``matplotlib.pyplot`` with the headless Agg backend selected."""
     import matplotlib
@@ -295,6 +302,7 @@ def _compare_grid_figure(
     ylabel: str,
     suptitle: str,
     markersize: float = 2.5,
+    xlabel: str = "unique missing experts per layer",
 ) -> bytes:
     """Render a 4x5 grid overlaying static (dashed) vs cached (solid) curves.
 
@@ -304,6 +312,7 @@ def _compare_grid_figure(
         ylabel: Label for the first subplot's y axis.
         suptitle: Figure title.
         markersize: Marker size for the cached curves.
+        xlabel: Label for every subplot's x axis.
 
     Returns:
         PNG bytes.
@@ -335,7 +344,7 @@ def _compare_grid_figure(
                 label=f"keep {int(ratio * 100)}% cache",
             )
         ax.set_title(title)
-        ax.set_xlabel("unique missing experts per layer")
+        ax.set_xlabel(xlabel)
         if xlim is not None:
             ax.set_xlim(*xlim)
         ax.grid(alpha=0.3)
@@ -393,7 +402,7 @@ def _resident_masks(
 
 
 # --------------------------------------------------------------------------- #
-# Adaptive expert cache (shared by the *_cache studies)
+# Adaptive expert cache (shared by the miss studies)
 # --------------------------------------------------------------------------- #
 class AdaptiveCache:
     """Per-layer LFU expert cache seeded from the training-hot resident set.
@@ -424,60 +433,59 @@ class AdaptiveCache:
         self.n_layers = n_layers
         self.n_experts = n_experts
         self.k_by_ratio = dict(k_by_ratio)
-        self.resident = {ratio: masks[ratio].copy() for ratio in RATIOS}
-        self.freq = {
-            ratio: np.zeros((n_layers, n_experts), dtype=np.float64)
-            for ratio in RATIOS
-        }
+        self.k = np.array([k_by_ratio[ratio] for ratio in RATIOS], dtype=np.int64)
+        # State is stacked on a leading ratio axis: [R, L, E].
+        self.resident = np.stack([masks[ratio].copy() for ratio in RATIOS])
+        self.freq = np.zeros((len(RATIOS), n_layers, n_experts), dtype=np.int64)
         self.train_rank = np.empty((n_layers, n_experts), dtype=np.int64)
         for layer in range(n_layers):
             order = np.argsort(counts[layer])[::-1]
             self.train_rank[layer, order] = np.arange(n_experts, dtype=np.int64)
+        # Single-integer encoding of the (missing, freq, train rank) priority, so
+        # the top-k set is taken with one argpartition instead of a full lexsort.
+        self._key_offset = np.int64(1) << 40
+        self._rank_bonus = (n_experts - 1) - self.train_rank
         self.loads = {ratio: 0 for ratio in RATIOS}
         self.evictions = {ratio: 0 for ratio in RATIOS}
 
-    def clone(self) -> "AdaptiveCache":
-        """Return an independent copy (used to give each batch size a fresh run)."""
-        other = object.__new__(AdaptiveCache)
-        other.n_layers = self.n_layers
-        other.n_experts = self.n_experts
-        other.k_by_ratio = dict(self.k_by_ratio)
-        other.resident = {r: self.resident[r].copy() for r in RATIOS}
-        other.freq = {r: self.freq[r].copy() for r in RATIOS}
-        other.train_rank = self.train_rank
-        other.loads = dict(self.loads)
-        other.evictions = dict(self.evictions)
-        return other
-
-    def observe_mask(self, ratio: float, demand: "np.ndarray") -> "np.ndarray":
-        """Observe one forward pass; return the per-layer miss count ``[n_layers]``.
+    def observe_mask_all(self, demand: "np.ndarray") -> "np.ndarray":
+        """Observe one forward pass for every ratio; return miss counts ``[R, L]``.
 
         ``demand`` is a boolean ``[n_layers, n_experts]`` set of demanded experts.
+        Each ratio updates its own independent resident set. The keep priority is
+        unchanged -- missing experts first, then higher frequency, then hotter
+        training rank -- but expressed as a single integer key so ``argpartition``
+        selects the top-k directly. Capacity is preserved exactly.
         """
         import numpy as np
 
-        resident = self.resident[ratio]
-        freq = self.freq[ratio]
-        miss = (demand & ~resident).sum(axis=1).astype(np.int64)
-        freq += demand
-        is_missing = demand & ~resident
-        k = self.k_by_ratio[ratio]
-        # Primary: missing first; secondary: higher frequency; tertiary: hotter rank.
-        order = np.lexsort((self.train_rank, -freq, ~is_missing), axis=-1)
+        resident = self.resident
+        is_missing = demand[None, :, :] & ~resident  # [R, L, E]
+        miss = is_missing.sum(axis=2).astype(np.int64)  # [R, L]
+        self.freq += demand
+        key = (
+            is_missing.astype(np.int64) * self._key_offset
+            + self.freq * self.n_experts
+            + self._rank_bonus
+        )  # [R, L, E]
         new = np.zeros_like(resident)
-        np.put_along_axis(new, order[:, :k], True, axis=1)
-        self.loads[ratio] += int((new & ~resident).sum())
-        self.evictions[ratio] += int((resident & ~new).sum())
-        self.resident[ratio] = new
+        for ri in range(len(RATIOS)):
+            k = int(self.k[ri])
+            idx = np.argpartition(key[ri], -k, axis=1)[:, -k:]
+            np.put_along_axis(new[ri], idx, True, axis=1)
+        for ri, ratio in enumerate(RATIOS):
+            self.loads[ratio] += int((new[ri] & ~resident[ri]).sum())
+            self.evictions[ratio] += int((resident[ri] & ~new[ri]).sum())
+        self.resident = new
         return miss
 
-    def observe_ids(self, ratio: float, ids: "np.ndarray") -> "np.ndarray":
-        """Observe one token's ``[n_layers, top_k]`` expert ids."""
+    def observe_ids_all(self, ids: "np.ndarray") -> "np.ndarray":
+        """Observe one token's ``[n_layers, top_k]`` expert ids for every ratio."""
         import numpy as np
 
         demand = np.zeros((self.n_layers, self.n_experts), dtype=bool)
         np.put_along_axis(demand, ids, True, axis=1)
-        return self.observe_mask(ratio, demand)
+        return self.observe_mask_all(demand)
 
     def traffic(self) -> dict[str, dict[str, int]]:
         """Per-ratio cumulative load/eviction counts and resident size."""
@@ -485,9 +493,9 @@ class AdaptiveCache:
             str(ratio): {
                 "loads": self.loads[ratio],
                 "evictions": self.evictions[ratio],
-                "resident": int(self.resident[ratio].sum()),
+                "resident": int(self.resident[ri].sum()),
             }
-            for ratio in RATIOS
+            for ri, ratio in enumerate(RATIOS)
         }
 
 

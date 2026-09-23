@@ -10,6 +10,7 @@ independent (test is unseen but starts from the same train-derived seed).
 Artifacts (in ``<run>/decode_miss/``):
     * ``distributions.csv``             -- split,batch,policy,ratio,missing,portion
     * ``04_static_vs_cached_decode.png`` -- 4x5 grid per split, static vs cached
+    * ``08_decode_cdf.png``             -- same grids as CDFs (P(missing <= m))
     * ``10_cache_traffic.png``          -- loads/evictions vs B, per split
     * ``summary.json``, ``run.log``
 """
@@ -29,6 +30,7 @@ from helper import (
     AnalysisContext,
     Curves,
     Event,
+    _cdf,
     _compare_grid_figure,
     _decode_ids,
     _dist_stats,
@@ -76,6 +78,7 @@ def _decode_cache_batches(
         return decode_cache[path]
 
     layer_axis = np.arange(n_layers)
+    masks_stack = np.stack([masks[ratio] for ratio in RATIOS])  # [R, L, E]
     out: dict[tuple[str, int], CacheCurves] = {}
     traffic: dict[str, dict[int, dict]] = {}
     for split in SPLITS:
@@ -105,11 +108,11 @@ def _decode_cache_batches(
                 for ids in sessions:
                     if step < ids.shape[0]:
                         np.put_along_axis(demand, ids[step], True, axis=1)
-                for ratio in RATIOS:
-                    static_miss = (demand & ~masks[ratio]).sum(axis=1)
-                    cached_miss = cache.observe_mask(ratio, demand)
-                    hist_static[ratio][layer_axis, static_miss] += 1
-                    hist_cached[ratio][layer_axis, cached_miss] += 1
+                static_miss = (demand[None, :, :] & ~masks_stack).sum(axis=2)  # [R, L]
+                cached_miss = cache.observe_mask_all(demand)  # [R, L]
+                for ri, ratio in enumerate(RATIOS):
+                    hist_static[ratio][layer_axis, static_miss[ri]] += 1
+                    hist_cached[ratio][layer_axis, cached_miss[ri]] += 1
             denom = max(n_steps * n_layers, 1)
             out[(split, batch)] = {
                 "static": {r: hist_static[r].sum(axis=0) / denom for r in RATIOS},
@@ -128,7 +131,7 @@ def _decode_cache_batches(
 
 
 def _fig_decode_cache(out, top_k: int, split: str) -> bytes:
-    """Figure 08: 4x5 grid of per-batch static vs cached curves for one split."""
+    """Figure 04: 4x5 grid of per-batch static vs cached curves for one split."""
     import numpy as np
 
     panels = [
@@ -146,6 +149,31 @@ def _fig_decode_cache(out, top_k: int, split: str) -> bytes:
         "portion of decode steps",
         f"Concurrent decode ({split}): static vs adaptive cache, "
         "unique missing experts per layer",
+    )
+
+
+def _fig_decode_cdf(out, top_k: int, split: str) -> bytes:
+    """Figure 08: CDF (``P(missing <= m)``) of the per-batch decode curves."""
+    import numpy as np
+
+    def to_cdf(curves: Curves) -> Curves:
+        return {ratio: _cdf(curves[ratio]) for ratio in RATIOS}
+
+    panels = [
+        (
+            f"batch B={batch}",
+            to_cdf(out[(split, batch)]["static"]),
+            to_cdf(out[(split, batch)]["cached"]),
+            {ratio: np.arange(top_k * batch + 1) for ratio in RATIOS},
+            (0, top_k * batch),
+        )
+        for batch in BATCH_SIZES
+    ]
+    return _compare_grid_figure(
+        panels,
+        "portion of decode steps (CDF)",
+        f"Concurrent decode ({split}) CDF: static vs adaptive cache",
+        xlabel="missing experts (<= m)",
     )
 
 
@@ -231,6 +259,12 @@ class DecodeMissAnalysis(Analysis):
                     if split == SPLITS[0]
                     else f"{self.name}/04_static_vs_cached_decode_{split}.png",
                     _fig_decode_cache(out, ctx.top_k, split),
+                )
+                yield _image_event(
+                    f"{self.name}/08_decode_cdf.png"
+                    if split == SPLITS[0]
+                    else f"{self.name}/08_decode_cdf_{split}.png",
+                    _fig_decode_cdf(out, ctx.top_k, split),
                 )
         yield _image_event(
             f"{self.name}/10_cache_traffic.png",

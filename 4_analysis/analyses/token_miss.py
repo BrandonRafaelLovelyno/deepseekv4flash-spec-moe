@@ -12,6 +12,7 @@ advantage (the hot set was chosen on it); test is unseen. Replay is capped at
 Artifacts (in ``<run>/token_miss/``):
     * ``distributions.csv``           -- split,dataset,policy,ratio,missing,portion
     * ``01_static_vs_cached_token.png`` -- pooled train vs test, static vs cached
+    * ``07_token_cdf.png``            -- same curves as CDFs (P(missing <= m))
     * ``summary.json``, ``run.log``
 """
 
@@ -31,6 +32,7 @@ from helper import (
     Curves,
     Event,
     GroupAccumulator,
+    _cdf,
     _dist_stats,
     _emit,
     _figure_bytes,
@@ -67,6 +69,7 @@ def _replay_split(
     shape = (len(RATIOS), n_layers, top_k + 1)
     layer_index = np.arange(n_layers)[None, :, None]
     layer_axis = np.arange(n_layers)
+    masks_stack = np.stack([masks[ratio] for ratio in RATIOS])  # [R, L, E]
 
     def accumulator() -> GroupAccumulator:
         return {
@@ -91,13 +94,14 @@ def _replay_split(
             cached_groups.setdefault(key, accumulator())
         for t in range(take):
             ids_t = ids[t]
-            for ri, ratio in enumerate(RATIOS):
-                resident = masks[ratio][layer_index, ids_t]  # [L, K] bool
-                static_miss = (top_k - resident.sum(axis=-1)).astype(np.int64)
-                cached_miss = cache.observe_ids(ratio, ids_t)
+            static_resident = masks_stack[:, layer_index, ids_t]  # [R, 1, L, K]
+            static_miss = (top_k - static_resident.sum(axis=-1)).squeeze(axis=1)
+            static_miss = static_miss.astype(np.int64)  # [R, L]
+            cached_miss = cache.observe_ids_all(ids_t)  # [R, L]
+            for ri in range(len(RATIOS)):
                 for key in keys:
-                    static_groups[key]["counts"][ri, layer_axis, static_miss] += 1
-                    cached_groups[key]["counts"][ri, layer_axis, cached_miss] += 1
+                    static_groups[key]["counts"][ri, layer_axis, static_miss[ri]] += 1
+                    cached_groups[key]["counts"][ri, layer_axis, cached_miss[ri]] += 1
         for key in keys:
             static_groups[key]["tokens"] += take
             cached_groups[key]["tokens"] += take
@@ -161,7 +165,7 @@ def _build_cache(ctx: AnalysisContext, logs: list[str]):
 def _fig_token_cache(
     pooled: dict[str, dict[str, Curves]], n_tokens_by_split: dict[str, int], top_k: int
 ) -> bytes:
-    """Figure 07: pooled train vs test, static vs cached, one bar pair per ratio."""
+    """Figure 01: pooled train vs test, static vs cached, one bar pair per ratio."""
     import numpy as np
 
     plt = _pyplot()
@@ -197,6 +201,48 @@ def _fig_token_cache(
     axes[0].set_ylabel("portion of tokens")
     axes[0].legend(fontsize=7, ncol=2)
     fig.suptitle("Token expert miss: static vs adaptive cache")
+    return _figure_bytes(fig)
+
+
+def _fig_token_cdf(
+    pooled: dict[str, dict[str, Curves]], n_tokens_by_split: dict[str, int], top_k: int
+) -> bytes:
+    """Figure 07: CDF (``P(missing <= m)``) of the pooled token curves."""
+    import numpy as np
+
+    plt = _pyplot()
+    x = np.arange(top_k + 1)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharey=True)
+    for ax, split in zip(axes, SPLITS):
+        if split not in pooled:
+            ax.axis("off")
+            continue
+        for ratio in RATIOS:
+            ax.plot(
+                x,
+                _cdf(pooled[split]["static"][ratio]),
+                "--",
+                linewidth=1.0,
+                color=COLORS[ratio],
+                label=f"keep {int(ratio * 100)}% static",
+            )
+            ax.plot(
+                x,
+                _cdf(pooled[split]["cached"][ratio]),
+                "-o",
+                markersize=3,
+                linewidth=1.2,
+                color=COLORS[ratio],
+                label=f"keep {int(ratio * 100)}% cache",
+            )
+        ax.set_xticks(x)
+        ax.set_ylim(0, 1)
+        ax.set_xlabel("missing experts (out of 6)")
+        ax.set_title(f"{split} ({n_tokens_by_split[split]:,} tokens)")
+        ax.grid(alpha=0.3)
+    axes[0].set_ylabel("P(missing <= m)")
+    axes[0].legend(fontsize=7, ncol=2)
+    fig.suptitle("Token expert miss CDF: static vs adaptive cache")
     return _figure_bytes(fig)
 
 
@@ -253,6 +299,10 @@ class TokenMissAnalysis(Analysis):
         yield _image_event(
             f"{self.name}/01_static_vs_cached_token.png",
             _fig_token_cache(pooled, ctx.n_tokens_by_split, ctx.top_k),
+        )
+        yield _image_event(
+            f"{self.name}/07_token_cdf.png",
+            _fig_token_cdf(pooled, ctx.n_tokens_by_split, ctx.top_k),
         )
 
         summary: dict[str, Any] = {

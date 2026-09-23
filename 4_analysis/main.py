@@ -51,6 +51,7 @@ from helper import (  # noqa: E402
     ANALYSIS_DIR,
     HARVEST_DIR,
     AnalysisContext,
+    _emit,
     _finalize,
     _prepare,
 )
@@ -106,8 +107,14 @@ def analyze(quick: bool = False):
     if not ctx.records:
         return
 
+    total = 0.0
     for analysis in ANALYSES:
+        started = time.perf_counter()
         yield from analysis.run(ctx)
+        elapsed = time.perf_counter() - started
+        total += elapsed
+        yield _emit(ctx.logs, f"[timing] {analysis.name}: {elapsed:.1f}s")
+    yield _emit(ctx.logs, f"[timing] all studies: {total:.1f}s")
 
     yield from _finalize(ctx)
     harvest_vol.commit()
