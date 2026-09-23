@@ -8,7 +8,19 @@ records, for every token in every one of the 43 blocks:
       shape ``[hc_mult=4, dim=4096]``;
     * the exact MoE router input -- the post-``ffn_norm`` compressed residual,
       shape ``[dim=4096]``;
-    * the routed expert ids and their top-k weights, shape ``[top_k=6]``.
+    * the full 256-way pre-bias router score vector -- ``sqrt(softplus(Wx))``,
+      shape ``[n_routed_experts=256]`` (the reference gate uses
+      ``score_func="sqrtsoftplus"``);
+    * the reference gate's exact top-k output -- the selected expert ids and
+      their routed weights, shape ``[top_k=6]``. These are the authoritative
+      routing record; the scores reproduce them only approximately, since they
+      are stored in ``float16``.
+
+Static router state. Two model-global tables are written once at the harvest
+root, because they are identical for every token and every slice:
+``router_bias.safetensors`` holds the per-layer selection bias (zeros on the
+hash layers) and ``hash_table.safetensors`` holds the ``tid2eid`` token-id ->
+expert-id tables that alone determine routing on layers ``0..n_hash_layers-1``.
 
 Slices. The reference attention only supports a full prefill (``start_pos=0``)
 or one-token decode, so every slice is a **prefix** ``[0:n]`` of one session.
@@ -26,15 +38,17 @@ Each token also gets ``token_idx`` (0-based position within its phase) and
 ``phase_index`` (ordinal of its phase, a maximal run of equal label).
 
 Payload. The residual states are stored as ``float8_e4m3fn`` with a per-tensor
-scale (recorded in the sidecar); expert ids are ``uint8`` and weights ``float16``,
-so a slice costs ~0.88 MB/token instead of ~1.76 MB/token.
+scale (recorded in the sidecar), the router scores as ``float16``, the expert ids
+as ``uint8`` and the routed weights as ``float16``, so a slice costs ~0.90 MB/token
+instead of ~1.76 MB/token.
 
 Pipeline (``modal run 3_harvest/main.py``):
     1. ``convert_ckpt`` (CPU, idempotent) reuses the converted MXFP4 checkpoint
        under the ``/ckpt`` volume (same artifact ``inference/main.py`` produces).
     2. ``harvest_all`` (single B300) loads the model once and harvests every
        selected slice, writing one safetensors file plus JSON sidecar per slice
-       under ``/harvest/<dataset_id>/<split>/`` and a corpus ``manifest.json``.
+       under ``/harvest/<dataset_id>/<split>/``, the two static router tables at
+       the harvest root, and a corpus ``manifest.json``.
 
 Prerequisites:
     modal secret create huggingface-secret HF_TOKEN=hf_...
@@ -57,6 +71,7 @@ from helper import (  # noqa: E402  (import path set up above)
     TEST_TOKENS,
     TRAIN_SESSIONS,
     TRAIN_TOKENS,
+    _extract_router_static,
     _harvest_forward,
     _install_capture,
     _load_streaming,
@@ -253,6 +268,32 @@ def harvest_all(max_seq_len: int = MAX_SEQ_LEN, seed: int = SEED) -> dict:
     torch.set_default_device("cuda")
 
     n_layers = len(model.layers)
+    router_bias, hash_table = _extract_router_static(model, torch)
+    if hash_table is not None:
+        lo, hi = int(hash_table.min()), int(hash_table.max())
+        if lo < 0 or hi >= args.n_routed_experts:
+            raise RuntimeError(
+                "hash-layer tid2eid tables look uninitialized: "
+                f"range [{lo}, {hi}] is outside [0, {args.n_routed_experts}). "
+                "Check that convert.py preserved `tid2eid` and that "
+                "_load_streaming loaded `gate.tid2eid`."
+            )
+    os.makedirs(HARVEST_DIR, exist_ok=True)
+    save_file(
+        {"bias": router_bias},
+        os.path.join(HARVEST_DIR, "router_bias.safetensors"),
+    )
+    if hash_table is not None:
+        save_file(
+            {"tid2eid": hash_table},
+            os.path.join(HARVEST_DIR, "hash_table.safetensors"),
+        )
+    harvest_vol.commit()
+    print(
+        f"router static: bias {tuple(router_bias.shape)}, "
+        f"hash tables {'none' if hash_table is None else tuple(hash_table.shape)}"
+    )
+
     buffers = {}
     _install_capture(model, buffers, torch)
     records = []
@@ -290,6 +331,11 @@ def harvest_all(max_seq_len: int = MAX_SEQ_LEN, seed: int = SEED) -> dict:
                     dtype=torch.bfloat16,
                     device="cpu",
                 )
+                buffers["scores"] = torch.empty(
+                    (n_tokens, n_layers, args.n_routed_experts),
+                    dtype=torch.float16,
+                    device="cpu",
+                )
                 buffers["topk_ids"] = torch.empty(
                     (n_tokens, n_layers, args.n_activated_experts),
                     dtype=torch.uint8,
@@ -321,6 +367,7 @@ def harvest_all(max_seq_len: int = MAX_SEQ_LEN, seed: int = SEED) -> dict:
                 tensors = {
                     "expanded": expanded_fp8,
                     "compressed": compressed_fp8,
+                    "scores": buffers["scores"],
                     "topk_ids": buffers["topk_ids"],
                     "topk_weights": buffers["topk_weights"],
                     "token_ids": torch.tensor(ids, dtype=torch.int32),
@@ -352,8 +399,12 @@ def harvest_all(max_seq_len: int = MAX_SEQ_LEN, seed: int = SEED) -> dict:
                     "compressed_scale": compressed_scale,
                     "expanded_dtype": "float8_e4m3fn",
                     "compressed_dtype": "float8_e4m3fn",
+                    "router_scores_dtype": "float16",
                     "topk_ids_dtype": "uint8",
                     "topk_weights_dtype": "float16",
+                    "score_func": args.score_func,
+                    "route_scale": args.route_scale,
+                    "n_hash_layers": args.n_hash_layers,
                     "payload_gb": round(payload_gb, 3),
                     "model_repo": BASE_REPO,
                     "model_revision": BASE_REV,
@@ -391,6 +442,16 @@ def harvest_all(max_seq_len: int = MAX_SEQ_LEN, seed: int = SEED) -> dict:
     manifest = {
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "seed": seed,
+        "score_func": args.score_func,
+        "route_scale": args.route_scale,
+        "n_hash_layers": args.n_hash_layers,
+        "n_routed_experts": args.n_routed_experts,
+        "router_bias_path": os.path.join(HARVEST_DIR, "router_bias.safetensors"),
+        "hash_table_path": (
+            os.path.join(HARVEST_DIR, "hash_table.safetensors")
+            if hash_table is not None
+            else None
+        ),
         "train_sessions": TRAIN_SESSIONS,
         "train_tokens": TRAIN_TOKENS,
         "test_sessions": TEST_SESSIONS,

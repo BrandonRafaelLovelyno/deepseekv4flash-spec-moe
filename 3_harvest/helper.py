@@ -28,10 +28,10 @@ MARK_END = "<｜end▁of▁sentence｜>"
 MARK_THINK_OPEN = "<think>"
 MARK_THINK_CLOSE = "</think>"
 
-# Maps capture-buffer name (``expanded`` / ``compressed`` / ``topk_ids`` /
-# ``topk_weights``) to its host tensor. The dict object is created once and its
-# values are replaced per slice, which is what lets the monkeypatched wrappers
-# retarget capture without being reinstalled.
+# Maps capture-buffer name (``expanded`` / ``compressed`` / ``scores`` /
+# ``topk_ids`` / ``topk_weights``) to its host tensor. The dict object is created
+# once and its values are replaced per slice, which is what lets the
+# monkeypatched wrappers retarget capture without being reinstalled.
 CaptureBuffers = dict[str, Any]
 
 # Tokenizer offset pairs: ``(char_start, char_end)`` per token.
@@ -125,6 +125,7 @@ def _install_capture(model: Any, buffers: CaptureBuffers, torch: Any) -> None:
             per slice.
         torch: The torch module (passed in to avoid a module-scope import).
     """
+    import torch.nn.functional as F
 
     def wrap_block(block, layer):
         original = block.forward
@@ -149,13 +150,29 @@ def _install_capture(model: Any, buffers: CaptureBuffers, torch: Any) -> None:
 
     def wrap_gate(block, layer):
         original = block.ffn.gate.forward
+        gate = block.ffn.gate
 
         def forward(x, input_ids=None):
+            # Run the reference gate unchanged so model routing is untouched,
+            # then capture its exact top-k output plus a recomputed pre-bias
+            # score vector. The gate projection has no bias, so
+            # ``F.linear(x, weight)`` is exact.
             weights, indices = original(x, input_ids)
             buffers["topk_weights"][:, layer].copy_(
                 weights.detach().to(torch.float16)
             )
             buffers["topk_ids"][:, layer].copy_(indices.detach().to(torch.uint8))
+            with torch.no_grad():
+                logits = F.linear(x.float(), gate.weight.float())
+                if gate.score_func == "softmax":
+                    scores = logits.softmax(dim=-1)
+                elif gate.score_func == "sigmoid":
+                    scores = logits.sigmoid()
+                else:
+                    scores = F.softplus(logits).sqrt()
+                buffers["scores"][:, layer].copy_(
+                    scores.detach().to(torch.float16)
+                )
             return weights, indices
 
         return forward
@@ -164,6 +181,47 @@ def _install_capture(model: Any, buffers: CaptureBuffers, torch: Any) -> None:
         block.forward = wrap_block(block, layer)
         block.ffn.forward = wrap_moe(block, layer)
         block.ffn.gate.forward = wrap_gate(block, layer)
+
+
+def _extract_router_static(model: Any, torch: Any) -> tuple[Any, Any]:
+    """Collect the static (non-per-token) router tables from the loaded model.
+
+    Two model-global artifacts, identical for every harvested slice:
+
+    * the per-layer selection bias -- the ``Gate.bias`` DeepSeek adds to the
+      pre-bias scores for top-k selection only. Hash layers carry no bias, so
+      their rows are zeros (see the ``n_hash_layers`` sidecar field);
+    * the per-hash-layer ``tid2eid`` token-id -> expert-id tables, which are the
+      only thing that determines layer ``0..n_hash_layers-1`` routing.
+
+    Args:
+        model: The loaded ``Transformer``.
+        torch: The torch module (passed in to avoid a module-scope import).
+
+    Returns:
+        ``(bias, tid2eid)`` where ``bias`` is ``[n_layers, n_routed_experts]``
+        fp32 and ``tid2eid`` is ``[n_hash_layers, vocab_size, top_k]`` int32, or
+        ``None`` when the model has no hash layers.
+    """
+    bias_rows = []
+    hash_tables = []
+    for block in model.layers:
+        gate = block.ffn.gate
+        if gate.bias is None:
+            bias_rows.append(
+                torch.zeros(
+                    gate.weight.shape[0], dtype=torch.float32, device="cpu"
+                )
+            )
+        else:
+            bias_rows.append(gate.bias.detach().to(torch.float32).cpu())
+        if gate.hash:
+            hash_tables.append(
+                gate.tid2eid.detach().to(torch.int32).cpu().contiguous()
+            )
+    bias = torch.stack(bias_rows)
+    tid2eid = torch.stack(hash_tables) if hash_tables else None
+    return bias, tid2eid
 
 
 def _harvest_forward(model: Any, input_ids: Any, torch: Any) -> Any:
