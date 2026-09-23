@@ -33,6 +33,7 @@ DATASETS = ("yi30-think", "yi30-nothink", "terminus2", "dsh")
 BATCH_SIZES = tuple(range(1, 21))
 SESSION_SEED = 33377335
 PREFILL_TOKEN_BUDGET = 200_000
+CACHE_TOKEN_BUDGET = 200_000
 
 COLORS = {0.25: "#4C72B0", 0.5: "#DD8452", 0.75: "#55A868"}
 
@@ -79,14 +80,6 @@ class DistStats(TypedDict):
     mean_missing: float
 
 
-class PrefillMetaEntry(TypedDict):
-    """Per-batch bookkeeping for the concurrent-prefill study."""
-
-    n_events: int
-    tokens_used: int
-    mean_coverage: dict[float, float]
-
-
 class GroupAccumulator(TypedDict):
     """Accumulator for one replay group (pooled or per-dataset).
 
@@ -108,9 +101,10 @@ class AnalysisContext:
 
     Built by ``_prepare`` (records, dims, session pools) and progressively
     filled by the studies in order: ``expert_ranking`` sets ``counts`` /
-    ``k_by_ratio`` / ``masks``; ``token_miss`` sets ``pooled`` / ``per_dataset``;
-    ``decode_miss`` sets ``batches``; ``prefill_miss`` sets ``prefills`` /
-    ``prefill_meta``. Later studies read what earlier ones wrote.
+    ``k_by_ratio`` / ``masks``; ``token_miss`` sets ``cache_pooled`` /
+    ``cache_per_dataset`` / ``cache_meta``; ``decode_miss`` sets
+    ``cache_batches``; ``prefill_miss`` sets ``cache_prefills``. Later studies
+    read what earlier ones wrote.
     """
 
     quick: bool
@@ -131,18 +125,28 @@ class AnalysisContext:
     n_test: int = 0
 
     by_dataset: dict[str, list[HarvestRecord]] = field(default_factory=dict)
+    test_by_dataset: dict[str, list[HarvestRecord]] = field(default_factory=dict)
 
     counts: "np.ndarray | None" = None
     k_by_ratio: dict[float, int] = field(default_factory=dict)
     masks: dict[float, "np.ndarray"] = field(default_factory=dict)
 
-    pooled: dict[str, Curves] = field(default_factory=dict)
-    per_dataset: dict[str, dict[str, Curves]] = field(default_factory=dict)
     n_tokens_by_split: dict[str, int] = field(default_factory=dict)
 
-    batches: dict[int, Curves] = field(default_factory=dict)
-    prefills: dict[int, Curves] = field(default_factory=dict)
-    prefill_meta: dict[int, PrefillMetaEntry] = field(default_factory=dict)
+    # Adaptive-cache studies (independent per split). Curves are nested
+    # ``split -> policy ("static"/"cached") -> Curves``; decode/prefill are
+    # additionally keyed by batch size.
+    cache_pooled: dict[str, dict[str, Curves]] = field(default_factory=dict)
+    cache_per_dataset: dict[str, dict[str, dict[str, Curves]]] = field(
+        default_factory=dict
+    )
+    cache_batches: dict[tuple[str, int], dict[str, Curves]] = field(
+        default_factory=dict
+    )
+    cache_prefills: dict[tuple[str, int], dict[str, Curves]] = field(
+        default_factory=dict
+    )
+    cache_meta: dict[str, Any] = field(default_factory=dict)
 
     def out_dir(self, name: str) -> str:
         """Return (creating it) this study's remote output subdirectory."""
@@ -192,14 +196,12 @@ def _write_run_log(out_dir: str, logs: list[str]) -> str:
     return path
 
 
-def _save_curve_csv(path: str, curves: dict[int, Curves]) -> None:
-    """Write a ``batch,ratio,missing,portion`` CSV (decode + prefill share this)."""
+def _write_rows(path: str, header: str, rows: list[str]) -> None:
+    """Write a pre-formatted CSV from ``rows`` (each already comma-joined)."""
     with open(path, "w", encoding="utf-8") as handle:
-        handle.write("batch,ratio,missing,portion\n")
-        for batch, by_ratio in curves.items():
-            for ratio in RATIOS:
-                for value, portion in enumerate(by_ratio[ratio]):
-                    handle.write(f"{batch},{ratio},{value},{portion:.8f}\n")
+        handle.write(header + "\n")
+        for row in rows:
+            handle.write(row + "\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -288,22 +290,20 @@ def _figure_bytes(fig: Any) -> bytes:
     return buffer.getvalue()
 
 
-def _batch_grid_figure(
-    panels: list[tuple[str, Curves, dict[float, Any], Any]],
+def _compare_grid_figure(
+    panels: list[tuple[str, Curves, Curves, dict[float, Any], Any]],
     ylabel: str,
     suptitle: str,
-    markersize: float = 3.0,
+    markersize: float = 2.5,
 ) -> bytes:
-    """Render a 4x5 grid of per-batch curves (shared by decode + prefill).
+    """Render a 4x5 grid overlaying static (dashed) vs cached (solid) curves.
 
     Args:
-        panels: One ``(title, curves, x_by_ratio, xlim)`` per batch. Decode uses
-            the same x for every ratio; prefill's curve lengths differ per ratio
-            (x capped at ``n_experts - k``), hence ``x_by_ratio`` maps each ratio
-            to its own x values. ``xlim`` may be ``None`` to auto-scale.
+        panels: One ``(title, static_curves, cached_curves, x_by_ratio, xlim)``
+            per batch. Curves are keyed by resident ratio.
         ylabel: Label for the first subplot's y axis.
         suptitle: Figure title.
-        markersize: Marker size for every curve.
+        markersize: Marker size for the cached curves.
 
     Returns:
         PNG bytes.
@@ -315,16 +315,24 @@ def _batch_grid_figure(
     n_rows = (len(panels) + n_cols - 1) // n_cols
     fig, grid = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.2 * n_rows))
     grid = np.atleast_1d(grid).ravel()
-    for ax, (title, curves, x_by_ratio, xlim) in zip(grid, panels):
+    for ax, (title, static, cached, x_by_ratio, xlim) in zip(grid, panels):
         for ratio in RATIOS:
             ax.plot(
                 x_by_ratio[ratio],
-                curves[ratio],
-                "-o",
-                markersize=markersize,
-                linewidth=1.2,
-                label=f"keep {int(ratio * 100)}%",
+                static[ratio],
+                "--",
+                linewidth=1.0,
                 color=COLORS[ratio],
+                label=f"keep {int(ratio * 100)}% static",
+            )
+            ax.plot(
+                x_by_ratio[ratio],
+                cached[ratio],
+                "-o",
+                linewidth=1.2,
+                markersize=markersize,
+                color=COLORS[ratio],
+                label=f"keep {int(ratio * 100)}% cache",
             )
         ax.set_title(title)
         ax.set_xlabel("unique missing experts per layer")
@@ -334,7 +342,7 @@ def _batch_grid_figure(
     for ax in grid[len(panels):]:
         ax.axis("off")
     grid[0].set_ylabel(ylabel)
-    grid[0].legend(fontsize=7)
+    grid[0].legend(fontsize=5.5, ncol=2)
     fig.suptitle(suptitle)
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     return _figure_bytes(fig)
@@ -385,6 +393,105 @@ def _resident_masks(
 
 
 # --------------------------------------------------------------------------- #
+# Adaptive expert cache (shared by the *_cache studies)
+# --------------------------------------------------------------------------- #
+class AdaptiveCache:
+    """Per-layer LFU expert cache seeded from the training-hot resident set.
+
+    Every ratio owns an independent, fixed-capacity (``k`` experts per layer)
+    resident set. Observing one forward pass:
+
+    1. records the miss count against the *current* resident set,
+    2. credits +1 frequency to every demanded expert,
+    3. evicts the coldest residents to make room for the newly demanded ones
+       (pure displacement -- no admission control).
+
+    Ties on frequency are broken by training rank (hotter stays). Capacity is
+    preserved exactly, so the cache holds the same number of experts as the
+    static ``masks`` it replaces.
+    """
+
+    def __init__(
+        self,
+        masks: dict[float, "np.ndarray"],
+        counts: "np.ndarray",
+        k_by_ratio: dict[float, int],
+        n_layers: int,
+        n_experts: int,
+    ) -> None:
+        import numpy as np
+
+        self.n_layers = n_layers
+        self.n_experts = n_experts
+        self.k_by_ratio = dict(k_by_ratio)
+        self.resident = {ratio: masks[ratio].copy() for ratio in RATIOS}
+        self.freq = {
+            ratio: np.zeros((n_layers, n_experts), dtype=np.float64)
+            for ratio in RATIOS
+        }
+        self.train_rank = np.empty((n_layers, n_experts), dtype=np.int64)
+        for layer in range(n_layers):
+            order = np.argsort(counts[layer])[::-1]
+            self.train_rank[layer, order] = np.arange(n_experts, dtype=np.int64)
+        self.loads = {ratio: 0 for ratio in RATIOS}
+        self.evictions = {ratio: 0 for ratio in RATIOS}
+
+    def clone(self) -> "AdaptiveCache":
+        """Return an independent copy (used to give each batch size a fresh run)."""
+        other = object.__new__(AdaptiveCache)
+        other.n_layers = self.n_layers
+        other.n_experts = self.n_experts
+        other.k_by_ratio = dict(self.k_by_ratio)
+        other.resident = {r: self.resident[r].copy() for r in RATIOS}
+        other.freq = {r: self.freq[r].copy() for r in RATIOS}
+        other.train_rank = self.train_rank
+        other.loads = dict(self.loads)
+        other.evictions = dict(self.evictions)
+        return other
+
+    def observe_mask(self, ratio: float, demand: "np.ndarray") -> "np.ndarray":
+        """Observe one forward pass; return the per-layer miss count ``[n_layers]``.
+
+        ``demand`` is a boolean ``[n_layers, n_experts]`` set of demanded experts.
+        """
+        import numpy as np
+
+        resident = self.resident[ratio]
+        freq = self.freq[ratio]
+        miss = (demand & ~resident).sum(axis=1).astype(np.int64)
+        freq += demand
+        is_missing = demand & ~resident
+        k = self.k_by_ratio[ratio]
+        # Primary: missing first; secondary: higher frequency; tertiary: hotter rank.
+        order = np.lexsort((self.train_rank, -freq, ~is_missing), axis=-1)
+        new = np.zeros_like(resident)
+        np.put_along_axis(new, order[:, :k], True, axis=1)
+        self.loads[ratio] += int((new & ~resident).sum())
+        self.evictions[ratio] += int((resident & ~new).sum())
+        self.resident[ratio] = new
+        return miss
+
+    def observe_ids(self, ratio: float, ids: "np.ndarray") -> "np.ndarray":
+        """Observe one token's ``[n_layers, top_k]`` expert ids."""
+        import numpy as np
+
+        demand = np.zeros((self.n_layers, self.n_experts), dtype=bool)
+        np.put_along_axis(demand, ids, True, axis=1)
+        return self.observe_mask(ratio, demand)
+
+    def traffic(self) -> dict[str, dict[str, int]]:
+        """Per-ratio cumulative load/eviction counts and resident size."""
+        return {
+            str(ratio): {
+                "loads": self.loads[ratio],
+                "evictions": self.evictions[ratio],
+                "resident": int(self.resident[ratio].sum()),
+            }
+            for ratio in RATIOS
+        }
+
+
+# --------------------------------------------------------------------------- #
 # Orchestration (called by ``main.analyze``)
 # --------------------------------------------------------------------------- #
 def _dataset_pools(
@@ -431,6 +538,7 @@ def _prepare(ctx: AnalysisContext) -> Iterator[Event]:
     ctx.datasets = [d for d in DATASETS if any(r["dataset_id"] == d for r in records)]
     ctx.n_tokens_by_split = {"train": ctx.n_train, "test": ctx.n_test}
     ctx.by_dataset = _dataset_pools(ctx.train, ctx.datasets, SESSION_SEED)
+    ctx.test_by_dataset = _dataset_pools(ctx.test, ctx.datasets, SESSION_SEED)
 
     yield _emit(
         ctx.logs,

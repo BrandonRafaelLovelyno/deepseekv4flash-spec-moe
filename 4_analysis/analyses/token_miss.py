@@ -1,28 +1,32 @@
-"""Study: per-token expert miss distribution (no batching).
+"""Study: per-token expert miss with an adaptive expert cache.
 
-Pass B of the original analysis. Replays every train/test token against the
-train-derived resident sets and tallies, per token and layer,
-``missing = top_k - (# experts resident)`` in 0..top_k. Curves are normalized
-per layer then averaged over the 43 layers, so each is a portion of tokens.
+Each split replays independently through an ``AdaptiveCache`` seeded from the
+training-hot set: every token measures its miss against the current resident
+set (static = fixed ``masks``, cached = adaptive), then the cache updates --
+demanded experts are credited and missing ones displace the coldest residents.
+
+Train and test start from the same train-derived seed, so train keeps its
+advantage (the hot set was chosen on it); test is unseen. Replay is capped at
+``CACHE_TOKEN_BUDGET`` tokens per split.
 
 Artifacts (in ``<run>/token_miss/``):
-    * ``distributions.csv``          -- split,dataset,ratio,missing,portion
-    * ``01_missing_distribution.png`` -- pooled train vs test, one bar per ratio
-    * ``02_per_dataset.png``         -- 2xN small multiples
-    * ``03_cumulative_missing.png``  -- portion needing at least m fetches
+    * ``distributions.csv``           -- split,dataset,policy,ratio,missing,portion
+    * ``01_static_vs_cached_token.png`` -- pooled train vs test, static vs cached
     * ``summary.json``, ``run.log``
 """
 
 from __future__ import annotations
 
 import os
-from typing import Iterator
+from typing import Any, Iterator
 
 from analyses.base import Analysis
 from helper import (
+    CACHE_TOKEN_BUDGET,
     COLORS,
     RATIOS,
     SPLITS,
+    AdaptiveCache,
     AnalysisContext,
     Curves,
     Event,
@@ -36,26 +40,33 @@ from helper import (
     _read_topk_ids,
     _utc_now,
     _write_json,
+    _write_rows,
     _write_run_log,
 )
 
 
-def _replay_tokens(
+def _replay_split(
+    split: str,
     records,
+    cache: AdaptiveCache,
     masks,
     n_layers: int,
     top_k: int,
+    budget: int,
     logs: list[str],
 ) -> Iterator[Event]:
-    """Tally per-token missing counts for every replay group.
+    """Replay one split's tokens, returning static + cached group accumulators.
 
-    Yields one ``log`` event per replayed slice and returns the group
-    accumulator dict keyed by ``(split, dataset_or_None)``.
+    Each token is one forward pass: the static miss uses the fixed ``masks``,
+    the cached miss uses (and then advances) ``cache``. Yields one ``log`` event
+    per replayed slice and returns ``(static_groups, cached_groups)`` keyed by
+    dataset id (or ``None`` for the pooled group).
     """
     import numpy as np
 
     shape = (len(RATIOS), n_layers, top_k + 1)
     layer_index = np.arange(n_layers)[None, :, None]
+    layer_axis = np.arange(n_layers)
 
     def accumulator() -> GroupAccumulator:
         return {
@@ -63,29 +74,38 @@ def _replay_tokens(
             "tokens": np.zeros((len(RATIOS), n_layers)),
         }
 
-    groups: dict[tuple[str, str | None], GroupAccumulator] = {}
-    for split in SPLITS:
-        for record in [r for r in records if r["split"] == split]:
-            ids = _read_topk_ids(record["path"])
-            n_tokens = ids.shape[0]
-            keys = [(split, None), (split, record["dataset_id"])]
-            for key in keys:
-                groups.setdefault(key, accumulator())
+    static_groups: dict[str | None, GroupAccumulator] = {}
+    cached_groups: dict[str | None, GroupAccumulator] = {}
+    used = 0
+    for record in records:
+        if used >= budget:
+            break
+        ids = _read_topk_ids(record["path"])
+        take = int(min(ids.shape[0], budget - used))
+        if take <= 0:
+            break
+        used += take
+        keys: list[str | None] = [None, record["dataset_id"]]
+        for key in keys:
+            static_groups.setdefault(key, accumulator())
+            cached_groups.setdefault(key, accumulator())
+        for t in range(take):
+            ids_t = ids[t]
             for ri, ratio in enumerate(RATIOS):
-                resident = masks[ratio][layer_index, ids]  # [T, L, K] bool
-                missing = top_k - resident.sum(axis=-1).astype(np.int64)  # [T, L]
-                for value in range(top_k + 1):
-                    per_layer = (missing == value).sum(axis=0)  # [L]
-                    for key in keys:
-                        groups[key]["counts"][ri, :, value] += per_layer
+                resident = masks[ratio][layer_index, ids_t]  # [L, K] bool
+                static_miss = (top_k - resident.sum(axis=-1)).astype(np.int64)
+                cached_miss = cache.observe_ids(ratio, ids_t)
                 for key in keys:
-                    groups[key]["tokens"][ri] += n_tokens
-            yield _emit(
-                logs,
-                f"replayed {split}/{record['dataset_id']}/{record['document_id']} "
-                f"({n_tokens} tokens)",
-            )
-    return groups
+                    static_groups[key]["counts"][ri, layer_axis, static_miss] += 1
+                    cached_groups[key]["counts"][ri, layer_axis, cached_miss] += 1
+        for key in keys:
+            static_groups[key]["tokens"] += take
+            cached_groups[key]["tokens"] += take
+        yield _emit(
+            logs,
+            f"{split}/{record['dataset_id']}/{record['document_id']} ({take} tokens)",
+        )
+    return static_groups, cached_groups
 
 
 def _curve(acc: GroupAccumulator) -> Curves:
@@ -95,130 +115,89 @@ def _curve(acc: GroupAccumulator) -> Curves:
     out: Curves = {}
     for ri, ratio in enumerate(RATIOS):
         tokens = np.maximum(acc["tokens"][ri], 1)[:, None]
-        per_layer = acc["counts"][ri] / tokens  # [L, K+1], rows sum to 1
-        out[ratio] = per_layer.mean(axis=0)  # [K+1], sums to 1
+        per_layer = acc["counts"][ri] / tokens  # [L, K+1]
+        out[ratio] = per_layer.mean(axis=0)
     return out
 
 
-def _build_curves(
-    groups: dict[tuple[str, str | None], GroupAccumulator], datasets: list[str]
-) -> tuple[dict[str, Curves], dict[str, dict[str, Curves]]]:
-    """Build the pooled and per-dataset curves for each split."""
-    pooled = {split: _curve(groups[(split, None)]) for split in SPLITS}
-    per_dataset = {
-        split: {ds: _curve(groups[(split, ds)]) for ds in datasets if (split, ds) in groups}
-        for split in SPLITS
-    }
-    return pooled, per_dataset
+def _build_cache(ctx: AnalysisContext, logs: list[str]):
+    """Replay every split through a fresh cache; return pooled/per-dataset curves."""
+    pooled: dict[str, dict[str, Curves]] = {}
+    per_dataset: dict[str, dict[str, dict[str, Curves]]] = {}
+    traffic: dict[str, dict] = {}
+    for split in SPLITS:
+        records = [r for r in ctx.records if r["split"] == split]
+        if not records:
+            continue
+        cache = AdaptiveCache(
+            ctx.masks, ctx.counts, ctx.k_by_ratio, ctx.n_layers, ctx.n_experts
+        )
+        static_groups, cached_groups = yield from _replay_split(
+            split,
+            records,
+            cache,
+            ctx.masks,
+            ctx.n_layers,
+            ctx.top_k,
+            CACHE_TOKEN_BUDGET,
+            logs,
+        )
+        pooled[split] = {
+            "static": _curve(static_groups[None]),
+            "cached": _curve(cached_groups[None]),
+        }
+        per_dataset[split] = {
+            ds: {
+                "static": _curve(static_groups[ds]),
+                "cached": _curve(cached_groups[ds]),
+            }
+            for ds in ctx.datasets
+            if ds in static_groups
+        }
+        traffic[split] = cache.traffic()
+    return pooled, per_dataset, traffic
 
 
-def _write_distributions_csv(
-    path: str, pooled: dict[str, Curves], per_dataset: dict[str, dict[str, Curves]]
-) -> None:
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write("split,dataset,ratio,missing,portion\n")
-        for split in SPLITS:
-            for ratio in RATIOS:
-                for value, portion in enumerate(pooled[split][ratio]):
-                    handle.write(f"{split},pooled,{ratio},{value},{portion:.8f}\n")
-            for ds, curves in per_dataset[split].items():
-                for ratio in RATIOS:
-                    for value, portion in enumerate(curves[ratio]):
-                        handle.write(f"{split},{ds},{ratio},{value},{portion:.8f}\n")
-
-
-def _fig_missing_distribution(
-    pooled: dict[str, Curves], n_tokens_by_split: dict[str, int], top_k: int
+def _fig_token_cache(
+    pooled: dict[str, dict[str, Curves]], n_tokens_by_split: dict[str, int], top_k: int
 ) -> bytes:
-    """Figure 01: pooled train vs test, one bar per ratio."""
+    """Figure 07: pooled train vs test, static vs cached, one bar pair per ratio."""
     import numpy as np
 
     plt = _pyplot()
-    width = 0.26
     x = np.arange(top_k + 1)
+    width = 0.13
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharey=True)
     for ax, split in zip(axes, SPLITS):
+        if split not in pooled:
+            ax.axis("off")
+            continue
         for i, ratio in enumerate(RATIOS):
+            base = (i - 1) * 0.3
             ax.bar(
-                x + (i - 1) * width,
-                pooled[split][ratio],
+                x + base - width / 2,
+                pooled[split]["static"][ratio],
                 width,
-                label=f"keep {int(ratio * 100)}%",
                 color=COLORS[ratio],
+                label=f"keep {int(ratio * 100)}% static",
+            )
+            ax.bar(
+                x + base + width / 2,
+                pooled[split]["cached"][ratio],
+                width,
+                color=COLORS[ratio],
+                hatch="//",
+                edgecolor="white",
+                label=f"keep {int(ratio * 100)}% cache",
             )
         ax.set_xticks(x)
         ax.set_xlabel("missing experts (out of 6)")
         ax.set_title(f"{split} ({n_tokens_by_split[split]:,} tokens)")
         ax.grid(axis="y", alpha=0.3)
     axes[0].set_ylabel("portion of tokens")
-    axes[0].legend(title="resident set")
-    fig.suptitle("Expert miss distribution when preserving hot experts")
+    axes[0].legend(fontsize=7, ncol=2)
+    fig.suptitle("Token expert miss: static vs adaptive cache")
     return _figure_bytes(fig)
-
-
-def _fig_per_dataset(
-    per_dataset: dict[str, dict[str, Curves]], datasets: list[str], top_k: int
-) -> bytes:
-    """Figure 02: 2xN per-dataset small multiples."""
-    import numpy as np
-
-    plt = _pyplot()
-    width = 0.26
-    x = np.arange(top_k + 1)
-    fig2, axes2 = plt.subplots(
-        2, len(datasets), figsize=(4 * len(datasets), 8), squeeze=False
-    )
-    for row, split in enumerate(SPLITS):
-        for col, ds in enumerate(datasets):
-            ax = axes2[row][col]
-            curves = per_dataset[split].get(ds)
-            if curves is None:
-                ax.axis("off")
-                continue
-            for i, ratio in enumerate(RATIOS):
-                ax.bar(
-                    x + (i - 1) * width,
-                    curves[ratio],
-                    width,
-                    color=COLORS[ratio],
-                )
-            ax.set_xticks(x)
-            ax.set_ylim(0, 1)
-            if row == len(SPLITS) - 1:
-                ax.set_xlabel("missing experts")
-            if col == 0:
-                ax.set_ylabel(f"{split}\nportion of tokens")
-            ax.set_title(ds)
-            ax.grid(axis="y", alpha=0.3)
-    fig2.suptitle("Per-dataset expert miss distribution")
-    return _figure_bytes(fig2)
-
-
-def _fig_cumulative_missing(pooled: dict[str, Curves], top_k: int) -> bytes:
-    """Figure 03: portion of tokens needing at least m fetches."""
-    import numpy as np
-
-    plt = _pyplot()
-    x = np.arange(top_k + 1)
-    fig3, ax3 = plt.subplots(figsize=(7, 4.5))
-    for split, style in zip(SPLITS, ("-o", "--s")):
-        for ratio in RATIOS:
-            dist = pooled[split][ratio]
-            cumulative = np.cumsum(dist[::-1])[::-1]
-            ax3.plot(
-                x,
-                cumulative,
-                style,
-                label=f"{split} keep {int(ratio * 100)}%",
-                color=COLORS[ratio],
-            )
-    ax3.set_xticks(x)
-    ax3.set_xlabel("at least m missing experts")
-    ax3.set_ylabel("portion of tokens")
-    ax3.set_title("Fraction of tokens needing at least m expert fetches")
-    ax3.grid(alpha=0.3)
-    ax3.legend(fontsize=8)
-    return _figure_bytes(fig3)
 
 
 class TokenMissAnalysis(Analysis):
@@ -228,62 +207,72 @@ class TokenMissAnalysis(Analysis):
         logs: list[str] = []
         out_dir = ctx.out_dir(self.name)
 
-        groups = yield from _replay_tokens(
-            ctx.records, ctx.masks, ctx.n_layers, ctx.top_k, logs
-        )
-        pooled, per_dataset = _build_curves(groups, ctx.datasets)
-        ctx.pooled = pooled
-        ctx.per_dataset = per_dataset
+        pooled, per_dataset, traffic = yield from _build_cache(ctx, logs)
+        ctx.cache_pooled = pooled
+        ctx.cache_per_dataset = per_dataset
+        ctx.cache_meta["token"] = {
+            "policy": "lfu-displacement",
+            "token_budget": CACHE_TOKEN_BUDGET,
+            "traffic": traffic,
+        }
 
         for split in SPLITS:
+            if split not in pooled:
+                continue
             for ratio in RATIOS:
-                stats = _dist_stats(pooled[split][ratio])
+                s = _dist_stats(pooled[split]["static"][ratio])
+                c = _dist_stats(pooled[split]["cached"][ratio])
                 yield _emit(
                     logs,
                     f"{split:5} keep {int(ratio * 100):>2}%: "
-                    f"fully resident {stats['portion_fully_resident']:.4f}, "
-                    f"needs fetch {stats['portion_needing_fetch']:.4f}, "
-                    f"mean missing {stats['mean_missing']:.4f}",
+                    f"mean missing static {s['mean_missing']:.4f} -> "
+                    f"cached {c['mean_missing']:.4f}",
                 )
 
-        _write_distributions_csv(
-            os.path.join(out_dir, "distributions.csv"), pooled, per_dataset
+        rows: list[str] = []
+        for split in SPLITS:
+            if split not in pooled:
+                continue
+            for policy in ("static", "cached"):
+                for ratio in RATIOS:
+                    for value, portion in enumerate(pooled[split][policy][ratio]):
+                        rows.append(f"{split},pooled,{policy},{ratio},{value},{portion:.8f}")
+            for ds, curves in per_dataset[split].items():
+                for policy in ("static", "cached"):
+                    for ratio in RATIOS:
+                        for value, portion in enumerate(curves[policy][ratio]):
+                            rows.append(
+                                f"{split},{ds},{policy},{ratio},{value},{portion:.8f}"
+                            )
+        _write_rows(
+            os.path.join(out_dir, "distributions.csv"),
+            "split,dataset,policy,ratio,missing,portion",
+            rows,
         )
 
         yield _image_event(
-            f"{self.name}/01_missing_distribution.png",
-            _fig_missing_distribution(pooled, ctx.n_tokens_by_split, ctx.top_k),
-        )
-        if ctx.datasets:
-            yield _image_event(
-                f"{self.name}/02_per_dataset.png",
-                _fig_per_dataset(per_dataset, ctx.datasets, ctx.top_k),
-            )
-        yield _image_event(
-            f"{self.name}/03_cumulative_missing.png",
-            _fig_cumulative_missing(pooled, ctx.top_k),
+            f"{self.name}/01_static_vs_cached_token.png",
+            _fig_token_cache(pooled, ctx.n_tokens_by_split, ctx.top_k),
         )
 
-        summary = {
+        summary: dict[str, Any] = {
             "run_id": ctx.run_id,
             "created_at": _utc_now(),
             "quick": ctx.quick,
             "ratios": list(RATIOS),
-            "n_layers": ctx.n_layers,
-            "top_k": ctx.top_k,
-            "n_experts": ctx.n_experts,
-            "datasets": ctx.datasets,
-            "n_tokens_by_split": ctx.n_tokens_by_split,
+            "policy": "lfu-displacement",
+            "token_budget": CACHE_TOKEN_BUDGET,
+            "traffic": traffic,
             "splits": {
                 split: {
-                    "n_tokens": ctx.n_tokens_by_split[split],
-                    "pooled": {str(r): _dist_stats(pooled[split][r]) for r in RATIOS},
-                    "per_dataset": {
-                        ds: {str(r): _dist_stats(curves[r]) for r in RATIOS}
-                        for ds, curves in per_dataset[split].items()
-                    },
+                    policy: {
+                        str(r): _dist_stats(pooled[split][policy][r])
+                        for r in RATIOS
+                    }
+                    for policy in ("static", "cached")
                 }
                 for split in SPLITS
+                if split in pooled
             },
         }
         _write_json(os.path.join(out_dir, "summary.json"), summary)

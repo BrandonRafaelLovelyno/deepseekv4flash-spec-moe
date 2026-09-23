@@ -9,7 +9,7 @@ This entrypoint is a thin harness. The actual studies live one-per-file under
 ``analyses/`` and are run as an ordered queue:
 
     expert_ranking   rank experts by train frequency; build the resident sets
-    token_miss       per-token miss distribution (pooled + per-dataset)
+    token_miss       per-token miss distribution, static vs adaptive LFU cache
     decode_miss      concurrent-decode unique missing experts (B=1..20)
     prefill_miss     concurrent-prefill unique missing experts (B=1..20)
     coverage         decode vs prefill coverage of the non-resident set

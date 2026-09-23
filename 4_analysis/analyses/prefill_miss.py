@@ -1,162 +1,205 @@
-"""Study: concurrent-prefill unique missing experts.
+"""Study: concurrent-prefill unique missing experts with an adaptive cache.
 
-Pass D of the original analysis. Assumes an incremental, KV-cached server: a
-turn's prefill is only its new non-assistant token phase (system + tools
-template, user turns, tool results), and with no chunking a phase is one
-forward pass. Phase jobs are pulled round-robin by turn index across sessions
-and packed B-wide into events; per event and layer the missing count is the
-number of distinct demanded experts absent from the resident set (bounded by
-``n_experts - k``). A per-B token budget caps the corpus replayed.
+For every batch size ``B`` and split, a fresh ``AdaptiveCache`` is seeded from
+the training-hot set, then prefill phases of that split are pulled round-robin by
+turn index and packed ``B``-wide into events. Each event measures the same
+observation twice -- against the fixed ``masks`` (static) and the evolving
+resident set (cached) -- and the cache then updates from the event's union of
+demanded experts. Train and test are independent; replay is capped at
+``PREFILL_TOKEN_BUDGET`` tokens per ``(split, B)``.
 
 Artifacts (in ``<run>/prefill_miss/``):
-    * ``prefill_distributions.csv``            -- batch,ratio,missing,portion
-    * ``05_prefill_missing_distribution.png``  -- 4x5 grid (B=1..20)
+    * ``distributions.csv``              -- split,batch,policy,ratio,missing,portion
+    * ``05_static_vs_cached_prefill.png`` -- 4x5 grid per split, static vs cached
+    * ``10_cache_traffic.png``           -- loads/evictions vs B, per split
     * ``summary.json``, ``run.log``
 """
 
 from __future__ import annotations
 
 import os
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
+
+if TYPE_CHECKING:
+    import numpy as np
 
 from analyses.base import Analysis
 from helper import (
     BATCH_SIZES,
+    COLORS,
     PREFILL_TOKEN_BUDGET,
     RATIOS,
+    SPLITS,
+    AdaptiveCache,
     AnalysisContext,
     Curves,
     Event,
-    PrefillMetaEntry,
-    _batch_grid_figure,
+    _compare_grid_figure,
     _dist_stats,
     _emit,
+    _figure_bytes,
     _file_event,
     _image_event,
     _prefill_phases,
-    _save_curve_csv,
+    _pyplot,
     _utc_now,
     _write_json,
+    _write_rows,
     _write_run_log,
 )
 
+CacheCurves = dict[str, Curves]
 
-def _prefill_batches(
-    datasets: list[str],
-    by_dataset,
-    masks,
-    k_by_ratio: dict[float, int],
-    n_layers: int,
-    n_experts: int,
-    logs: list[str],
-) -> Iterator[Event]:
-    """Replay concurrent prefill events, one log event per batch size.
 
-    Returns ``(prefills, prefill_meta)``.
-    """
-    import numpy as np
-
-    prefill_cache: dict[str, list] = {}
-
-    def prefill_phases(record):
-        path = record["path"]
-        if path not in prefill_cache:
-            prefill_cache[path] = _prefill_phases(path)
-        return prefill_cache[path]
-
-    session_records = [
-        record for dataset in datasets for record in by_dataset[dataset]
-    ]
-    phases_by_session = [prefill_phases(record) for record in session_records]
-    max_turns = max((len(phases) for phases in phases_by_session), default=0)
-    queue = [
+def _queue_for(pools, datasets: list[str], phases) -> list["np.ndarray"]:
+    """Flatten a split's sessions and order phase jobs round-robin by turn index."""
+    session_records = [record for ds in datasets for record in pools[ds]]
+    phases_by_session = [phases(record) for record in session_records]
+    max_turns = max((len(p) for p in phases_by_session), default=0)
+    return [
         phases_by_session[s][turn]
         for turn in range(max_turns)
         for s in range(len(phases_by_session))
         if turn < len(phases_by_session[s])
     ]
 
-    prefills: dict[int, Curves] = {}
-    prefill_meta: dict[int, PrefillMetaEntry] = {}
-    for batch in BATCH_SIZES:
-        caps = {ratio: n_experts - k_by_ratio[ratio] for ratio in RATIOS}
-        hist = {
-            ratio: np.zeros((n_layers, caps[ratio] + 1), dtype=np.int64)
-            for ratio in RATIOS
-        }
-        coverage_sum = {ratio: 0.0 for ratio in RATIOS}
-        coverage_n = 0
-        n_events = 0
-        tokens_used = 0
-        for start in range(0, len(queue), batch):
-            jobs = queue[start:start + batch]
-            event_tokens = sum(job.shape[0] for job in jobs)
-            if n_events and tokens_used + event_tokens > PREFILL_TOKEN_BUDGET:
-                break
-            event_ids = np.concatenate(jobs, axis=0)
-            for layer in range(n_layers):
-                present = (
-                    np.bincount(
-                        event_ids[:, layer, :].astype(np.int64).ravel(),
-                        minlength=n_experts,
-                    )
-                    > 0
-                )
+
+def _prefill_cache_batches(
+    datasets: list[str],
+    pools_by_split: dict[str, dict],
+    masks,
+    counts,
+    k_by_ratio: dict[float, int],
+    n_layers: int,
+    n_experts: int,
+    logs: list[str],
+) -> Iterator[Event]:
+    """Replay every ``(split, B)``; return ``(curves, traffic)``."""
+    import numpy as np
+
+    phase_cache: dict[str, list] = {}
+
+    def phases(record):
+        path = record["path"]
+        if path not in phase_cache:
+            phase_cache[path] = _prefill_phases(path)
+        return phase_cache[path]
+
+    layer_axis = np.arange(n_layers)
+    layer_index = np.arange(n_layers)[None, :, None]
+    out: dict[tuple[str, int], CacheCurves] = {}
+    traffic: dict[str, dict[int, dict]] = {}
+    for split in SPLITS:
+        pools = pools_by_split.get(split, {})
+        split_datasets = [d for d in datasets if pools.get(d)]
+        if not split_datasets:
+            continue
+        queue = _queue_for(pools, split_datasets, phases)
+        split_traffic: dict[int, dict] = {}
+        for batch in BATCH_SIZES:
+            cache = AdaptiveCache(masks, counts, k_by_ratio, n_layers, n_experts)
+            caps = {ratio: n_experts - k_by_ratio[ratio] for ratio in RATIOS}
+            hist_static = {
+                ratio: np.zeros((n_layers, caps[ratio] + 1), dtype=np.int64)
+                for ratio in RATIOS
+            }
+            hist_cached = {
+                ratio: np.zeros((n_layers, caps[ratio] + 1), dtype=np.int64)
+                for ratio in RATIOS
+            }
+            n_events = 0
+            tokens_used = 0
+            for start in range(0, len(queue), batch):
+                jobs = queue[start:start + batch]
+                event_tokens = sum(job.shape[0] for job in jobs)
+                if n_events and tokens_used + event_tokens > PREFILL_TOKEN_BUDGET:
+                    break
+                event_ids = np.concatenate(jobs, axis=0)
+                demand = np.zeros((n_layers, n_experts), dtype=bool)
+                demand[layer_index, event_ids] = True
                 for ratio in RATIOS:
-                    missing = int((present & ~masks[ratio][layer]).sum())
-                    hist[ratio][layer, missing] += 1
-                    coverage_sum[ratio] += missing / max(caps[ratio], 1)
-                    if ratio == RATIOS[0]:
-                        coverage_n += 1
-            n_events += 1
-            tokens_used += event_tokens
-            if tokens_used >= PREFILL_TOKEN_BUDGET:
-                break
-        prefills[batch] = {
-            ratio: hist[ratio].sum(axis=0) / max(n_events * n_layers, 1)
-            for ratio in RATIOS
-        }
-        prefill_meta[batch] = {
-            "n_events": n_events,
-            "tokens_used": tokens_used,
-            "mean_coverage": {
-                ratio: coverage_sum[ratio] / max(coverage_n, 1) for ratio in RATIOS
-            },
-        }
-        stats = _dist_stats(prefills[batch][RATIOS[-1]])
-        yield _emit(
-            logs,
-            f"prefill batch {batch:>2}: {n_events} events, {tokens_used} tokens, "
-            f"keep 75% mean missing {stats['mean_missing']:.3f}, "
-            f"coverage {prefill_meta[batch]['mean_coverage'][RATIOS[-1]]:.3f}",
-        )
-    return prefills, prefill_meta
+                    static_miss = (demand & ~masks[ratio]).sum(axis=1)
+                    cached_miss = cache.observe_mask(ratio, demand)
+                    hist_static[ratio][layer_axis, static_miss] += 1
+                    hist_cached[ratio][layer_axis, cached_miss] += 1
+                n_events += 1
+                tokens_used += event_tokens
+                if tokens_used >= PREFILL_TOKEN_BUDGET:
+                    break
+            denom = max(n_events * n_layers, 1)
+            out[(split, batch)] = {
+                "static": {r: hist_static[r].sum(axis=0) / denom for r in RATIOS},
+                "cached": {r: hist_cached[r].sum(axis=0) / denom for r in RATIOS},
+            }
+            split_traffic[batch] = cache.traffic()
+            stats = _dist_stats(out[(split, batch)]["cached"][RATIOS[-1]])
+            yield _emit(
+                logs,
+                f"{split:5} batch {batch:>2}: {n_events} events, {tokens_used} tokens, "
+                f"keep 75% mean missing {stats['mean_missing']:.3f}, "
+                f"loads {cache.loads[RATIOS[-1]]}",
+            )
+        traffic[split] = split_traffic
+    return out, traffic
 
 
-def _fig_prefill_missing(
-    prefills: dict[int, Curves], k_by_ratio: dict[float, int], n_experts: int
-) -> bytes:
-    """Figure 05: 4x5 grid of per-batch prefill miss distributions."""
+def _fig_prefill_cache(out, k_by_ratio, n_experts: int, split: str) -> bytes:
+    """Figure 09: 4x5 grid of per-batch static vs cached curves for one split."""
     import numpy as np
 
     panels = [
         (
             f"batch B={batch}",
-            prefills[batch],
-            {
-                ratio: np.arange(n_experts - k_by_ratio[ratio] + 1)
-                for ratio in RATIOS
-            },
+            out[(split, batch)]["static"],
+            out[(split, batch)]["cached"],
+            {ratio: np.arange(n_experts - k_by_ratio[ratio] + 1) for ratio in RATIOS},
             None,
         )
         for batch in BATCH_SIZES
     ]
-    return _batch_grid_figure(
+    return _compare_grid_figure(
         panels,
         "portion of prefill events",
-        "Concurrent prefill: unique missing experts per layer, x capped at 256-k",
-        markersize=2.5,
+        f"Concurrent prefill ({split}): static vs adaptive cache, "
+        "unique missing experts per layer, x capped at 256-k",
     )
+
+
+def _fig_traffic(traffic) -> bytes:
+    """Figure 10: cache loads/evictions across batch sizes, per ratio and split."""
+    plt = _pyplot()
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), sharey=False)
+    for ax, split in zip(axes, SPLITS):
+        if split not in traffic:
+            ax.axis("off")
+            continue
+        xs = list(traffic[split].keys())
+        for ratio in RATIOS:
+            loads = [traffic[split][b][str(ratio)]["loads"] for b in xs]
+            evictions = [traffic[split][b][str(ratio)]["evictions"] for b in xs]
+            ax.plot(
+                xs,
+                loads,
+                "-o",
+                markersize=3,
+                color=COLORS[ratio],
+                label=f"keep {int(ratio * 100)}% load",
+            )
+            ax.plot(
+                xs,
+                evictions,
+                "--s",
+                markersize=3,
+                color=COLORS[ratio],
+                label=f"keep {int(ratio * 100)}% evict",
+            )
+        ax.set_xlabel("batch size B")
+        ax.set_title(split)
+        ax.grid(alpha=0.3)
+    axes[0].set_ylabel("cumulative expert loads / evictions")
+    axes[0].legend(fontsize=6, ncol=2)
+    fig.suptitle("Adaptive cache traffic (prefill)")
+    return _figure_bytes(fig)
 
 
 class PrefillMissAnalysis(Analysis):
@@ -166,22 +209,46 @@ class PrefillMissAnalysis(Analysis):
         logs: list[str] = []
         out_dir = ctx.out_dir(self.name)
 
-        prefills, prefill_meta = yield from _prefill_batches(
+        out, traffic = yield from _prefill_cache_batches(
             ctx.datasets,
-            ctx.by_dataset,
+            {"train": ctx.by_dataset, "test": ctx.test_by_dataset},
             ctx.masks,
+            ctx.counts,
             ctx.k_by_ratio,
             ctx.n_layers,
             ctx.n_experts,
             logs,
         )
-        ctx.prefills = prefills
-        ctx.prefill_meta = prefill_meta
+        ctx.cache_prefills = out
+        ctx.cache_meta["prefill"] = {
+            "policy": "lfu-displacement",
+            "traffic": traffic,
+        }
 
-        _save_curve_csv(os.path.join(out_dir, "prefill_distributions.csv"), prefills)
+        rows: list[str] = []
+        for (split, batch), curves in out.items():
+            for policy in ("static", "cached"):
+                for ratio in RATIOS:
+                    for value, portion in enumerate(curves[policy][ratio]):
+                        rows.append(
+                            f"{split},{batch},{policy},{ratio},{value},{portion:.8f}"
+                        )
+        _write_rows(
+            os.path.join(out_dir, "distributions.csv"),
+            "split,batch,policy,ratio,missing,portion",
+            rows,
+        )
+
+        for split in SPLITS:
+            if split in traffic:
+                yield _image_event(
+                    f"{self.name}/05_static_vs_cached_prefill.png"
+                    if split == SPLITS[0]
+                    else f"{self.name}/05_static_vs_cached_prefill_{split}.png",
+                    _fig_prefill_cache(out, ctx.k_by_ratio, ctx.n_experts, split),
+                )
         yield _image_event(
-            f"{self.name}/05_prefill_missing_distribution.png",
-            _fig_prefill_missing(prefills, ctx.k_by_ratio, ctx.n_experts),
+            f"{self.name}/10_cache_traffic.png", _fig_traffic(traffic)
         )
 
         summary = {
@@ -189,23 +256,29 @@ class PrefillMissAnalysis(Analysis):
             "created_at": _utc_now(),
             "quick": ctx.quick,
             "ratios": list(RATIOS),
-            "prefills": {
-                str(batch): {
-                    "n_events": prefill_meta[batch]["n_events"],
-                    "tokens_used": prefill_meta[batch]["tokens_used"],
-                    "mean_coverage": {
-                        str(r): round(prefill_meta[batch]["mean_coverage"][r], 6)
-                        for r in RATIOS
-                    },
-                    "distributions": {
-                        str(r): _dist_stats(prefills[batch][r]) for r in RATIOS
-                    },
+            "policy": "lfu-displacement",
+            "traffic": traffic,
+            "batches": {
+                split: {
+                    str(batch): {
+                        policy: {
+                            str(r): _dist_stats(out[(split, batch)][policy][r])
+                            for r in RATIOS
+                        }
+                        for policy in ("static", "cached")
+                    }
+                    for batch in BATCH_SIZES
+                    if (split, batch) in out
                 }
-                for batch in BATCH_SIZES
+                for split in SPLITS
+                if split in traffic
             },
         }
         _write_json(os.path.join(out_dir, "summary.json"), summary)
 
-        for name in ("prefill_distributions.csv", "summary.json"):
+        for name in ("distributions.csv", "summary.json"):
             yield _file_event(os.path.join(out_dir, name), f"{self.name}/{name}")
         yield _file_event(_write_run_log(out_dir, logs), f"{self.name}/run.log")
+
+
+__all__ = ["PrefillMissAnalysis"]

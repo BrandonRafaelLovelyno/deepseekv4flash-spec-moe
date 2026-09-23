@@ -1,15 +1,16 @@
-"""Study: concurrent-decode unique missing experts.
+"""Study: concurrent-decode unique missing experts with an adaptive cache.
 
-Pass C of the original analysis. For each batch size B in 1..20, picks B
-training decode sessions round-robin across datasets (seeded), replays their
-decode steps concurrently, and counts, per step and layer, the number of
-**distinct** demanded experts absent from the resident set (fetch-once, so
-duplicates collapse; in 0..top_k*B). A step still counts once some sessions
-finish decoding.
+For every batch size ``B`` and split, a fresh ``AdaptiveCache`` is seeded from
+the training-hot set, then ``B`` decode sessions of that split are replayed
+concurrently. Each step measures the same observations twice -- against the
+fixed ``masks`` (static) and the evolving resident set (cached) -- and the cache
+then updates from the step's union of demanded experts. Train and test are
+independent (test is unseen but starts from the same train-derived seed).
 
 Artifacts (in ``<run>/decode_miss/``):
-    * ``batch_distributions.csv``            -- batch,ratio,missing,portion
-    * ``04_batch_missing_distribution.png``  -- 4x5 grid (B=1..20)
+    * ``distributions.csv``             -- split,batch,policy,ratio,missing,portion
+    * ``04_static_vs_cached_decode.png`` -- 4x5 grid per split, static vs cached
+    * ``10_cache_traffic.png``          -- loads/evictions vs B, per split
     * ``summary.json``, ``run.log``
 """
 
@@ -21,42 +22,50 @@ from typing import Iterator
 from analyses.base import Analysis
 from helper import (
     BATCH_SIZES,
+    COLORS,
     RATIOS,
+    SPLITS,
+    AdaptiveCache,
     AnalysisContext,
     Curves,
     Event,
-    _batch_grid_figure,
+    _compare_grid_figure,
     _decode_ids,
     _dist_stats,
     _emit,
+    _figure_bytes,
     _file_event,
     _image_event,
-    _save_curve_csv,
+    _pyplot,
     _utc_now,
     _write_json,
+    _write_rows,
     _write_run_log,
 )
 
+CacheCurves = dict[str, Curves]
 
-def _decode_batches(
+
+def _session_for(slot: int, datasets: list[str], pools) -> dict:
+    """Round-robin pick: dataset by slot, then the round-th session in its pool."""
+    dataset = datasets[slot % len(datasets)]
+    pool = pools[dataset]
+    return pool[(slot // len(datasets)) % len(pool)]
+
+
+def _decode_cache_batches(
     datasets: list[str],
-    by_dataset,
+    pools_by_split: dict[str, dict],
     masks,
+    counts,
+    k_by_ratio: dict[float, int],
     n_layers: int,
     n_experts: int,
     top_k: int,
     logs: list[str],
 ) -> Iterator[Event]:
-    """Replay concurrent decode batches, one log event per batch size.
-
-    Returns the ``{batch: curves}`` mapping.
-    """
+    """Replay every ``(split, B)``; return ``(curves, traffic)``."""
     import numpy as np
-
-    def session_for(slot: int):
-        dataset = datasets[slot % len(datasets)]
-        pool = by_dataset[dataset]
-        return pool[(slot // len(datasets)) % len(pool)]
 
     decode_cache: dict[str, "np.ndarray"] = {}
 
@@ -66,55 +75,115 @@ def _decode_batches(
             decode_cache[path] = _decode_ids(path)
         return decode_cache[path]
 
-    batches: dict[int, Curves] = {}
-    for batch in BATCH_SIZES:
-        sessions = [decode_ids(session_for(slot)) for slot in range(batch)]
-        n_steps = max(s.shape[0] for s in sessions)
-        max_missing = top_k * batch
-        hist = {
-            ratio: np.zeros((n_layers, max_missing + 1), dtype=np.int64)
-            for ratio in RATIOS
-        }
-        for layer in range(n_layers):
-            demand = np.zeros((n_steps, n_experts), dtype=bool)
-            for ids in sessions:
-                rows = np.arange(ids.shape[0])
-                demand[rows[:, None], ids[:, layer, :]] = True
-            demanded = demand.sum(axis=1)
-            for ratio in RATIOS:
-                resident = masks[ratio][layer]
-                missing = demanded - (demand & resident).sum(axis=1)
-                hist[ratio][layer] += np.bincount(missing, minlength=max_missing + 1)
-        batches[batch] = {
-            ratio: hist[ratio].sum(axis=0) / (n_steps * n_layers) for ratio in RATIOS
-        }
-        stats = _dist_stats(batches[batch][RATIOS[-1]])
-        yield _emit(
-            logs,
-            f"batch {batch:>2}: {n_steps} decode steps, up to {max_missing} missing; "
-            f"keep 75% mean missing {stats['mean_missing']:.3f}",
-        )
-    return batches
+    layer_axis = np.arange(n_layers)
+    out: dict[tuple[str, int], CacheCurves] = {}
+    traffic: dict[str, dict[int, dict]] = {}
+    for split in SPLITS:
+        pools = pools_by_split.get(split, {})
+        split_datasets = [d for d in datasets if pools.get(d)]
+        if not split_datasets:
+            continue
+        split_traffic: dict[int, dict] = {}
+        for batch in BATCH_SIZES:
+            cache = AdaptiveCache(masks, counts, k_by_ratio, n_layers, n_experts)
+            sessions = [
+                decode_ids(_session_for(slot, split_datasets, pools))
+                for slot in range(batch)
+            ]
+            n_steps = max(s.shape[0] for s in sessions)
+            max_missing = top_k * batch
+            hist_static = {
+                ratio: np.zeros((n_layers, max_missing + 1), dtype=np.int64)
+                for ratio in RATIOS
+            }
+            hist_cached = {
+                ratio: np.zeros((n_layers, max_missing + 1), dtype=np.int64)
+                for ratio in RATIOS
+            }
+            for step in range(n_steps):
+                demand = np.zeros((n_layers, n_experts), dtype=bool)
+                for ids in sessions:
+                    if step < ids.shape[0]:
+                        np.put_along_axis(demand, ids[step], True, axis=1)
+                for ratio in RATIOS:
+                    static_miss = (demand & ~masks[ratio]).sum(axis=1)
+                    cached_miss = cache.observe_mask(ratio, demand)
+                    hist_static[ratio][layer_axis, static_miss] += 1
+                    hist_cached[ratio][layer_axis, cached_miss] += 1
+            denom = max(n_steps * n_layers, 1)
+            out[(split, batch)] = {
+                "static": {r: hist_static[r].sum(axis=0) / denom for r in RATIOS},
+                "cached": {r: hist_cached[r].sum(axis=0) / denom for r in RATIOS},
+            }
+            split_traffic[batch] = cache.traffic()
+            stats = _dist_stats(out[(split, batch)]["cached"][RATIOS[-1]])
+            yield _emit(
+                logs,
+                f"{split:5} batch {batch:>2}: {n_steps} steps, "
+                f"keep 75% mean missing {stats['mean_missing']:.3f}, "
+                f"loads {cache.loads[RATIOS[-1]]}",
+            )
+        traffic[split] = split_traffic
+    return out, traffic
 
 
-def _fig_batch_missing(batches: dict[int, Curves], top_k: int) -> bytes:
-    """Figure 04: 4x5 grid of per-batch decode miss distributions."""
+def _fig_decode_cache(out, top_k: int, split: str) -> bytes:
+    """Figure 08: 4x5 grid of per-batch static vs cached curves for one split."""
     import numpy as np
 
     panels = [
         (
             f"batch B={batch}",
-            batches[batch],
+            out[(split, batch)]["static"],
+            out[(split, batch)]["cached"],
             {ratio: np.arange(top_k * batch + 1) for ratio in RATIOS},
             (0, top_k * batch),
         )
         for batch in BATCH_SIZES
     ]
-    return _batch_grid_figure(
+    return _compare_grid_figure(
         panels,
         "portion of decode steps",
-        "Concurrent decode: unique missing experts per layer (averaged over 43 layers)",
+        f"Concurrent decode ({split}): static vs adaptive cache, "
+        "unique missing experts per layer",
     )
+
+
+def _fig_traffic(traffic, key: str, xlabel: str) -> bytes:
+    """Figure 10: cache loads/evictions across batch sizes, per ratio and split."""
+    plt = _pyplot()
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), sharey=False)
+    for ax, split in zip(axes, SPLITS):
+        if split not in traffic:
+            ax.axis("off")
+            continue
+        xs = list(traffic[split].keys())
+        for ratio in RATIOS:
+            loads = [traffic[split][b][str(ratio)]["loads"] for b in xs]
+            evictions = [traffic[split][b][str(ratio)]["evictions"] for b in xs]
+            ax.plot(
+                xs,
+                loads,
+                "-o",
+                markersize=3,
+                color=COLORS[ratio],
+                label=f"keep {int(ratio * 100)}% load",
+            )
+            ax.plot(
+                xs,
+                evictions,
+                "--s",
+                markersize=3,
+                color=COLORS[ratio],
+                label=f"keep {int(ratio * 100)}% evict",
+            )
+        ax.set_xlabel(xlabel)
+        ax.set_title(split)
+        ax.grid(alpha=0.3)
+    axes[0].set_ylabel("cumulative expert loads / evictions")
+    axes[0].legend(fontsize=6, ncol=2)
+    fig.suptitle(f"Adaptive cache traffic ({key})")
+    return _figure_bytes(fig)
 
 
 class DecodeMissAnalysis(Analysis):
@@ -124,21 +193,48 @@ class DecodeMissAnalysis(Analysis):
         logs: list[str] = []
         out_dir = ctx.out_dir(self.name)
 
-        batches = yield from _decode_batches(
+        out, traffic = yield from _decode_cache_batches(
             ctx.datasets,
-            ctx.by_dataset,
+            {"train": ctx.by_dataset, "test": ctx.test_by_dataset},
             ctx.masks,
+            ctx.counts,
+            ctx.k_by_ratio,
             ctx.n_layers,
             ctx.n_experts,
             ctx.top_k,
             logs,
         )
-        ctx.batches = batches
+        ctx.cache_batches = out
+        ctx.cache_meta["decode"] = {
+            "policy": "lfu-displacement",
+            "traffic": traffic,
+        }
 
-        _save_curve_csv(os.path.join(out_dir, "batch_distributions.csv"), batches)
+        rows: list[str] = []
+        for (split, batch), curves in out.items():
+            for policy in ("static", "cached"):
+                for ratio in RATIOS:
+                    for value, portion in enumerate(curves[policy][ratio]):
+                        rows.append(
+                            f"{split},{batch},{policy},{ratio},{value},{portion:.8f}"
+                        )
+        _write_rows(
+            os.path.join(out_dir, "distributions.csv"),
+            "split,batch,policy,ratio,missing,portion",
+            rows,
+        )
+
+        for split in SPLITS:
+            if split in traffic:
+                yield _image_event(
+                    f"{self.name}/04_static_vs_cached_decode.png"
+                    if split == SPLITS[0]
+                    else f"{self.name}/04_static_vs_cached_decode_{split}.png",
+                    _fig_decode_cache(out, ctx.top_k, split),
+                )
         yield _image_event(
-            f"{self.name}/04_batch_missing_distribution.png",
-            _fig_batch_missing(batches, ctx.top_k),
+            f"{self.name}/10_cache_traffic.png",
+            _fig_traffic(traffic, "decode", "batch size B"),
         )
 
         summary = {
@@ -146,13 +242,29 @@ class DecodeMissAnalysis(Analysis):
             "created_at": _utc_now(),
             "quick": ctx.quick,
             "ratios": list(RATIOS),
+            "policy": "lfu-displacement",
+            "traffic": traffic,
             "batches": {
-                str(batch): {str(r): _dist_stats(batches[batch][r]) for r in RATIOS}
-                for batch in BATCH_SIZES
+                split: {
+                    str(batch): {
+                        policy: {
+                            str(r): _dist_stats(out[(split, batch)][policy][r])
+                            for r in RATIOS
+                        }
+                        for policy in ("static", "cached")
+                    }
+                    for batch in BATCH_SIZES
+                    if (split, batch) in out
+                }
+                for split in SPLITS
+                if split in traffic
             },
         }
         _write_json(os.path.join(out_dir, "summary.json"), summary)
 
-        for name in ("batch_distributions.csv", "summary.json"):
+        for name in ("distributions.csv", "summary.json"):
             yield _file_event(os.path.join(out_dir, name), f"{self.name}/{name}")
         yield _file_event(_write_run_log(out_dir, logs), f"{self.name}/run.log")
+
+
+__all__ = ["DecodeMissAnalysis"]

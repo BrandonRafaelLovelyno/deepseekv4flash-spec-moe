@@ -1,10 +1,10 @@
 """Study: coverage of the non-resident expert set (decode vs prefill).
 
-Reads the results the ``decode_miss`` and ``prefill_miss`` studies wrote into
-``ctx`` and compares how much of the non-resident per-layer expert set is
-demanded as the batch grows. For each ratio ``cap = n_experts - k``; decode
-coverage is the mean missing count divided by ``cap``, prefill coverage is the
-``mean_coverage`` the prefill study already recorded.
+Reads the ``static`` policy results the ``decode_miss`` and ``prefill_miss``
+studies wrote into ``ctx.cache_batches`` / ``ctx.cache_prefills`` (train split,
+matching the non-adaptive resident set) and compares how much of the non-resident
+per-layer expert set is demanded as the batch grows. For each ratio
+``cap = n_experts - k``; coverage is the mean missing count divided by ``cap``.
 
 Artifacts (in ``<run>/coverage/``):
     * ``06_coverage.png`` -- decode vs prefill coverage, one line pair per ratio
@@ -34,26 +34,38 @@ from helper import (
 )
 
 
-def _coverage(batches, prefill_meta, k_by_ratio, n_experts):
+def _coverage(cache_batches, cache_prefills, k_by_ratio, n_experts, split="train"):
     """Compute the decode and prefill coverage curves for every ratio.
+
+    Reads the ``static`` policy curves the decode/prefill studies wrote for
+    ``split`` (``train`` by default, matching the non-adaptive resident set).
 
     Returns ``(batch_sizes, coverage)`` where ``coverage[ratio]`` is
     ``{"decode": [...], "prefill": [...]}``.
     """
     import numpy as np
 
-    batch_sizes = list(BATCH_SIZES)
+    batch_sizes = [
+        batch
+        for batch in BATCH_SIZES
+        if (split, batch) in cache_batches and (split, batch) in cache_prefills
+    ]
     coverage: dict[float, dict[str, list[float]]] = {}
     for ratio in RATIOS:
-        cap = n_experts - k_by_ratio[ratio]
+        cap = max(n_experts - k_by_ratio[ratio], 1)
         decode_coverage = []
+        prefill_coverage = []
         for batch in batch_sizes:
-            distribution = batches[batch][ratio]
-            missing = np.arange(distribution.shape[0])
-            decode_coverage.append(float((distribution * missing).sum()) / max(cap, 1))
-        prefill_coverage = [
-            prefill_meta[batch]["mean_coverage"][ratio] for batch in batch_sizes
-        ]
+            decode_distribution = cache_batches[(split, batch)]["static"][ratio]
+            decode_missing = np.arange(decode_distribution.shape[0])
+            decode_coverage.append(
+                float((decode_distribution * decode_missing).sum()) / cap
+            )
+            prefill_distribution = cache_prefills[(split, batch)]["static"][ratio]
+            prefill_missing = np.arange(prefill_distribution.shape[0])
+            prefill_coverage.append(
+                float((prefill_distribution * prefill_missing).sum()) / cap
+            )
         coverage[ratio] = {"decode": decode_coverage, "prefill": prefill_coverage}
     return batch_sizes, coverage
 
@@ -93,8 +105,11 @@ class CoverageAnalysis(Analysis):
         out_dir = ctx.out_dir(self.name)
 
         batch_sizes, coverage = _coverage(
-            ctx.batches, ctx.prefill_meta, ctx.k_by_ratio, ctx.n_experts
+            ctx.cache_batches, ctx.cache_prefills, ctx.k_by_ratio, ctx.n_experts
         )
+        if not batch_sizes:
+            yield _emit(logs, "no decode/prefill results to compare")
+            return
         yield _emit(logs, f"compared decode vs prefill coverage over B={batch_sizes[0]}..{batch_sizes[-1]}")
 
         yield _image_event(
