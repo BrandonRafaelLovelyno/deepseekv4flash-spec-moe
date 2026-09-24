@@ -1,6 +1,6 @@
 """Predictor architectures for the single-variant routing prototype.
 
-Both architectures map an activation vector to the exact score space of the
+All architectures map an activation vector to the exact score space of the
 reference router, ``sqrt(softplus(logits))``. No layer carries a bias: the
 target is the *pre*-bias score and DeepSeek's gate projection has no bias.
 
@@ -46,6 +46,22 @@ class SwiGLUMLP(nn.Module):
         return scores_from_logits(self.out(h))
 
 
+class MLP(nn.Module):
+    """Plain two-layer MLP: ``sqrt(softplus(down(gelu(up(x)))))``.
+
+    Unlike ``SwiGLUMLP`` the hidden layer is a single GELU projection, not a
+    gated product.
+    """
+
+    def __init__(self, d_in: int, n_experts: int, hidden: int = 4096) -> None:
+        super().__init__()
+        self.up = nn.Linear(d_in, hidden, bias=False)
+        self.down = nn.Linear(hidden, n_experts, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return scores_from_logits(self.down(F.gelu(self.up(x))))
+
+
 def build_model(
     arch: str,
     d_in: int,
@@ -58,4 +74,6 @@ def build_model(
         return LowRankAdapter(d_in, n_experts, rank=rank)
     if arch == "swiglu":
         return SwiGLUMLP(d_in, n_experts, hidden=hidden)
+    if arch == "mlp":
+        return MLP(d_in, n_experts, hidden=hidden)
     raise ValueError(f"unknown arch: {arch!r}")

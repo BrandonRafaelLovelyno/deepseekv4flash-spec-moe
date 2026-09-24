@@ -108,7 +108,13 @@ def train_variant(config_text: str, run_id: str) -> dict:
 
     # The reference selects experts by top-k(score + bias); the bias is applied
     # only at selection, never to the pre-bias score the model is trained on.
-    layer_bias = load_router_bias(manifest, harvest_dir)[layer]
+    router_bias = load_router_bias(manifest, harvest_dir)
+    layer_bias = router_bias[layer]
+    print(
+        f"router bias: available {tuple(router_bias.shape)} "
+        f"(layer {layer} nonzero={int((layer_bias != 0).sum())})",
+        flush=True,
+    )
 
     train_cfg = cfg["data"]["train"]
     eval_cfg = cfg["data"]["eval"]
@@ -260,6 +266,8 @@ def train_variant(config_text: str, run_id: str) -> dict:
     }
     with open(os.path.join(out_dir, "metrics.json"), "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
+    with open(os.path.join(out_dir, "config.yaml"), "w", encoding="utf-8") as handle:
+        handle.write(config_text)
     training_vol.commit()
 
     fig, (ax_loss, ax_recall) = plt.subplots(1, 2, figsize=(11, 3.6))
@@ -345,6 +353,8 @@ def main(config: str = "") -> None:
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "metrics.json"), "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
+    with open(os.path.join(out_dir, "config.yaml"), "w", encoding="utf-8") as handle:
+        handle.write(config_text)
     with open(os.path.join(out_dir, "curves.png"), "wb") as handle:
         handle.write(result["png"])
     _write_history_csv(

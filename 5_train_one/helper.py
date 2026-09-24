@@ -26,7 +26,7 @@ HARVEST_DIR = "/harvest"
 TRAINING_DIR = "/training"
 MANIFEST_PATH = os.path.join(HARVEST_DIR, "manifest.json")
 
-ARCHS = ("lowrank", "swiglu")
+ARCHS = ("lowrank", "swiglu", "mlp")
 INPUT_KINDS = ("compressed", "expanded")
 DATASETS = ("yi30-think", "yi30-nothink", "terminus2", "dsh")
 

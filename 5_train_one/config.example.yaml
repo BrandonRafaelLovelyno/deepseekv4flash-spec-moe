@@ -26,9 +26,9 @@ task:
   input: compressed           # compressed (router input, 4096) | expanded (16384)
 
 model:
-  arch: lowrank               # lowrank | swiglu
+  arch: lowrank               # lowrank | swiglu | mlp
   rank: 128                   # lowrank only
-  hidden: 4096                # swiglu only
+  hidden: 4096                # swiglu | mlp
 
 optim:
   lr: 3.0e-4
