@@ -1,0 +1,48 @@
+# Prototype config for 5_train_one.
+#
+# Copy this to config.yaml (gitignored) and edit; re-run with:
+#     modal run 5_train_one/main.py
+#
+# Every field below is optional -- omitted fields fall back to the same values
+# shown here (see CONFIG_DEFAULTS in helper.py).
+
+seed: 0
+
+data:
+  harvest_dir: /harvest
+  train:
+    # Subset of: yi30-think, yi30-nothink, terminus2, dsh. null = all four.
+    datasets: [yi30-think, yi30-nothink, terminus2, dsh]
+    max_slices: null          # cap the number of training slices (random)
+    max_tokens: 72000         # cap total training tokens (random subsample)
+  eval:
+    split: test               # held-out split; never trained on
+    datasets: null            # null = every dataset present
+    max_tokens: 40000         # random, sampled once so metrics are comparable
+
+task:
+  layer: 20                   # target layer L
+  distance: 1                 # input is the activation of L - distance
+  input: compressed           # compressed (router input, 4096) | expanded (16384)
+
+model:
+  arch: lowrank               # lowrank | swiglu
+  rank: 128                   # lowrank only
+  hidden: 4096                # swiglu only
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 0.0
+  grad_clip: 1.0
+  epochs: 20
+  batch_size: 8192
+  scheduler: cosine           # cosine | none
+
+eval:
+  every: 1                    # run evaluation every N epochs
+  chunk_tokens: 16384         # forward-pass chunk size at evaluation
+  ks: [6, 12, 24]             # recall@k reported per epoch (6 = needed set size)
+
+output:
+  volume_dir: /training       # Modal volume mount
+  save_best: true             # keep the checkpoint with the best eval KL
