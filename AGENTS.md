@@ -33,3 +33,30 @@ it directly rather than reverse-engineering behavior from the vLLM fork.
 
 Because `checkpoints/` is gitignored, these files are not in the repo — check the
 directory locally before assuming a design detail.
+
+## Code layout: keep top-level functions at one level of abstraction
+
+Entry points (`main`, a Modal `@app.function`) should read as a short sequence
+of named verbs, not a mix of orchestration and mechanics. Keep these rules when
+touching the numbered stage directories (`2_data_check`, `5_train_one`, …):
+
+- **No mechanics at the top level.** File IO (`open`/`json.dump`/`write`), plot
+  layout (`subplot`/`set_xlabel`), and manual `for`-over-batches loops belong in
+  their own module behind a single named call. A 20-line `open(...)` block in a
+  function means it is at the wrong level.
+- **One module per concern.** Split by role, not by layer: e.g. `reporting.py`
+  (artifacts + prints), `plots.py` (figures returning `bytes`), `training.py`
+  (loop/eval/checkpoint). Each function does one thing.
+- **Unify duplicated logic.** If the same validation/setup appears in two places
+  (e.g. task geometry in both `populate_cache` and the trainer), extract it to a
+  single function in `helper.py` and call it from both.
+- **Respect the import contract.** `helper.py` and anything the local
+  entrypoint imports must not import `torch`/`numpy`/`yaml`/`matplotlib` at
+  module scope — the local entrypoint runs without those stacks. Put heavy
+  imports inside the function (or inside the module's functions) as in
+  `training.py` / `plots.py`.
+- **Register new modules on the image.** Any new local module must be added to
+  `.add_local_python_source(...)` or it will be missing inside the container.
+- **Verify without the GPU stack:** `python -m py_compile <files>` plus an
+  import test asserting `torch` is absent from `sys.modules`; exercise pure
+  helpers (CSV/report writes, plots) with a synthetic run.
