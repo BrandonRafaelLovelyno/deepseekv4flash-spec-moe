@@ -33,6 +33,7 @@ DISTRIBUTION_COLUMNS = [
     "decode_portion",
     "chunk_size",
     "ratio",
+    "policy",
     "fetch",
     "missing",
     "count",
@@ -53,8 +54,8 @@ def _write_histograms(path: str, histograms: dict) -> None:
     import numpy as np
 
     payload = {
-        f"{split}|{portion}|{chunk_size}|{ratio}|{fetch}": counts
-        for (split, portion, chunk_size, ratio, fetch), counts in histograms.items()
+        f"{split}|{portion}|{chunk_size}|{ratio}|{policy}|{fetch}": counts
+        for (split, portion, chunk_size, ratio, policy, fetch), counts in histograms.items()
     }
     np.savez_compressed(path, **payload)
 
@@ -115,17 +116,28 @@ def print_report(run_id: str, summary: dict[str, Any], out_dir: str) -> None:
     )
     ratio = max(float(r) for r in sim["ready_ratios"])
 
-    print(f"\nmean missing experts per chunk (fetch={fetch}, keep {int(ratio * 100)}%):")
-    header = "  split  decode   " + "".join(f"B={b:<6}" for b in sorted(sim["chunk_sizes"]))
-    print(header)
-    for split in summary["config"]["data"]["split"]:
-        for portion in sorted(float(f) for f in sim["decode_portions"]):
-            cells = []
-            for size in sorted(int(b) for b in sim["chunk_sizes"]):
-                key = f"{split}|{portion}|{size}|{ratio}|{fetch}"
-                stats = summary["combos"].get(key)
-                cells.append(f"{stats['mean_missing']:<8.3f}" if stats else f"{'-':<8}")
-            print(f"  {split:<5}  {int(portion * 100):>3}%    " + "".join(cells))
+    def mean_table(policy: str, label: str, fetch_value: int) -> None:
+        print(
+            f"\nmean missing experts per chunk ({label}, keep {int(ratio * 100)}%):"
+        )
+        header = "  split  decode   " + "".join(
+            f"B={b:<6}" for b in sorted(sim["chunk_sizes"])
+        )
+        print(header)
+        for split in summary["config"]["data"]["split"]:
+            for portion in sorted(float(f) for f in sim["decode_portions"]):
+                cells = []
+                for size in sorted(int(b) for b in sim["chunk_sizes"]):
+                    key = f"{split}|{portion}|{size}|{ratio}|{policy}|{fetch_value}"
+                    stats = summary["combos"].get(key)
+                    cells.append(
+                        f"{stats['mean_missing']:<8.3f}" if stats else f"{'-':<8}"
+                    )
+                print(f"  {split:<5}  {int(portion * 100):>3}%    " + "".join(cells))
+
+    mean_table("static", f"static, fetch={fetch}", fetch)
+    if "cached" in summary.get("policies", []):
+        mean_table("cached", "adaptive cache (oracle)", 0)
 
     print("\ndispersal (distinct sessions/chunk, min within-session gap):")
     for key, stats in summary["diagnostics"].items():

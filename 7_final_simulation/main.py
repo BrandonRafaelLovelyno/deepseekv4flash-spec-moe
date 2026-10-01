@@ -7,8 +7,12 @@ Two stages, split so the GPU is used only where it computes:
   predicted top-k experts on the simulation volume.
 * ``simulate`` (CPU only) replays the cached predictions under a realistic mixed
   chunked-prefill load. For every chunk it measures how many of the chunk's
-  demanded experts are missing after the static hot set is unioned with the top-N
-  predicted non-resident experts, and reports the CDF of that miss count.
+  demanded experts are missing under two resident-set policies (see
+  ``config.yaml``'s ``simulation.policies``): ``static``, the hot set unioned
+  with the top-N predicted non-resident experts; and ``cached``, the adaptive
+  LFU-displacement cache from ``4_analysis`` (an oracle, seeded from the hot set
+  and updated from the chunk's ground-truth demand). It reports the CDF of that
+  miss count for each policy.
 
 The static hot set comes from ``4_analysis``'s per-layer expert counts (the
 ``ready_ratios`` hottest experts); the predictor and its bias come from the

@@ -2,13 +2,20 @@
 
 This is the CPU half of the stage. It reads the per-token predictions the GPU
 ``predict`` stage cached, then sweeps the pre-built chunk plans for every
-``(decode_portion, chunk_size, resident_ratio, fetch_count)`` combination,
-measuring the unique demanded experts not covered by the resident hot set
-unioned with the top-N predicted non-resident experts. No GPU and no torch: the
-whole stage is numpy plus the cache files.
+``(decode_portion, chunk_size, resident_ratio, policy, fetch_count)``
+combination. Two resident-set policies share the chunk loop (see
+``config.yaml``'s ``simulation.policies``):
 
-numpy is imported inside functions so the local entrypoint can import this module
-without the scientific stack.
+* ``static`` -- the fixed training-hot mask, optionally topped up by the top-N
+  predicted non-resident experts from that chunk's prediction frequency;
+* ``cached`` -- the adaptive LFU-displacement ``AdaptiveCache`` (mirrors
+  ``4_analysis``), seeded from the same hot mask and updated once per chunk from
+  the chunk's ground-truth demand. It is an *oracle*: it observes the true routed
+  experts, so it upper-bounds any prediction-driven loader.
+
+No GPU and no torch: the whole stage is numpy plus the cache files. numpy is
+imported inside functions so the local entrypoint can import this module without
+the scientific stack.
 """
 
 from __future__ import annotations
@@ -34,7 +41,7 @@ from helper import (
     utc_now,
 )
 
-HistKey = tuple[str, float, int, float, int]
+HistKey = tuple[str, float, int, float, str, int]
 PlanKey = tuple[str, float, int]
 
 
@@ -64,7 +71,7 @@ def simulate(
     pred_dir = prediction_dir(cfg["output"]["volume_dir"], resolved_id)
     validate_predictions(cfg, cache_manifest, resolved_id, metas, pred_dir)
 
-    total: dict[str, dict] = {"hist": {}, "union": {}, "tokens": {}}
+    total: dict[str, dict] = {"hist": {}, "union": {}, "tokens": {}, "traffic": {}}
     for index, meta in enumerate(metas, start=1):
         print(
             f"[sim] layer {index}/{len(metas)} L{meta['layer']:02d} "
@@ -76,10 +83,10 @@ def simulate(
             split: read_cached_prediction(pred_dir, meta["layer"], split)
             for split in layer_splits
         }
-        hist, union, tokens = replay_layer(
+        hist, union, tokens, traffic = replay_layer(
             cfg, dims, cache_dir, cache_manifest, plans, meta, predictions
         )
-        _accumulate(total, hist, union, tokens)
+        _accumulate(total, hist, union, tokens, traffic)
 
     return finalize(
         cfg, run_id, resolved_id, metas, skipped, dims, total, diagnostics
@@ -212,22 +219,40 @@ def replay_layer(
     plans: dict[PlanKey, Any],
     meta: dict[str, Any],
     predictions: dict[str, Any],
-) -> tuple[dict[HistKey, Any], dict[PlanKey, int], dict[PlanKey, int]]:
+) -> tuple[
+    dict[HistKey, Any],
+    dict[PlanKey, int],
+    dict[PlanKey, int],
+    dict[PlanKey, dict],
+]:
     """Sweep one layer's chunk plans against its cached predictions.
 
-    Returns ``(histograms, demand_union, token_counts)`` keyed by chunk plan.
+    Two resident-set policies share the chunk loop:
+
+    * ``static`` -- the fixed training-hot mask, optionally topped up by the
+      top-N predicted non-resident experts *for this chunk only* (``fetch``);
+    * ``cached`` -- the adaptive ``AdaptiveCache`` seeded from the same mask and
+      updated once per chunk from the chunk's ground-truth demand (an oracle:
+      it sees the true routed experts). ``fetch`` is not meaningful here and is
+      recorded as ``0``.
+
+    Returns ``(histograms, demand_union, token_counts, cache_traffic)`` keyed by
+    chunk plan.
     """
     import numpy as np
 
+    from helper import AdaptiveCache
+
     sim = cfg["simulation"]
     n_experts = int(dims["n_experts"])
-    ratios = [float(ratio) for ratio in sim["ready_ratios"]]
+    ratios = tuple(float(ratio) for ratio in sim["ready_ratios"])
+    policies = tuple(str(policy) for policy in sim["policies"])
     fetches = sorted(int(count) for count in sim["fetch_counts"])
+    cached = "cached" in policies
+    static = "static" in policies
 
-    masks, k_by_ratio = resident_masks(
-        read_cached_expert_counts(cache_dir, cache_manifest, meta["layer"]),
-        tuple(ratios),
-    )
+    counts = read_cached_expert_counts(cache_dir, cache_manifest, meta["layer"])
+    masks, k_by_ratio = resident_masks(counts, ratios)
     splits = sorted({key[0] for key in plans})
     truths = {
         split: read_cached_topk(cache_dir, cache_manifest, split, meta["layer"])
@@ -237,15 +262,33 @@ def replay_layer(
     histograms: dict[HistKey, Any] = {}
     demand_union: dict[PlanKey, int] = {}
     token_counts: dict[PlanKey, int] = {}
+    traffic: dict[PlanKey, dict] = {}
+
+    def histogram(
+        split: str,
+        portion: float,
+        chunk_size: int,
+        ratio: float,
+        policy: str,
+        fetch: int,
+    ) -> Any:
+        key: HistKey = (split, portion, chunk_size, ratio, policy, fetch)
+        if key not in histograms:
+            histograms[key] = np.zeros(
+                n_experts - int(k_by_ratio[ratio]) + 1, dtype=np.int64
+            )
+        return histograms[key]
 
     for plan_key, plan in plans.items():
         split, portion, chunk_size = plan_key
         truth = truths[split]
         predicted = predictions[split]
+        cache = (
+            AdaptiveCache(masks, counts, k_by_ratio, ratios, n_experts)
+            if cached
+            else None
+        )
         for chunk in plan.chunks:
-            frequency = np.bincount(
-                predicted[chunk].ravel().astype(np.int64), minlength=n_experts
-            )
             demand = np.zeros(n_experts, dtype=bool)
             demand[truth[chunk].ravel().astype(np.int64)] = True
             demand_union[plan_key] = demand_union.get(plan_key, 0) + int(
@@ -254,22 +297,32 @@ def replay_layer(
             token_counts[plan_key] = token_counts.get(plan_key, 0) + int(
                 chunk.shape[0]
             )
-            for ratio in ratios:
-                mask = masks[ratio]
-                ranked = _rank_nonresident(frequency, mask)
-                for fetch in fetches:
-                    available = mask
-                    if fetch > 0:
-                        available = mask.copy()
-                        available[ranked[:fetch]] = True
-                    missing = int(np.count_nonzero(demand & ~available))
-                    key: HistKey = (split, portion, chunk_size, ratio, fetch)
-                    if key not in histograms:
-                        histograms[key] = np.zeros(
-                            n_experts - int(k_by_ratio[ratio]) + 1, dtype=np.int64
-                        )
-                    histograms[key][missing] += 1
-    return histograms, demand_union, token_counts
+            if static:
+                frequency = np.bincount(
+                    predicted[chunk].ravel().astype(np.int64), minlength=n_experts
+                )
+                for ratio in ratios:
+                    mask = masks[ratio]
+                    ranked = _rank_nonresident(frequency, mask)
+                    for fetch in fetches:
+                        available = mask
+                        if fetch > 0:
+                            available = mask.copy()
+                            available[ranked[:fetch]] = True
+                        missing = int(np.count_nonzero(demand & ~available))
+                        histogram(
+                            split, portion, chunk_size, ratio, "static", fetch
+                        )[missing] += 1
+            if cache is not None:
+                cached_miss = cache.observe_mask(demand)
+                for ri, ratio in enumerate(ratios):
+                    key = histogram(
+                        split, portion, chunk_size, ratio, "cached", 0
+                    )
+                    key[int(cached_miss[ri])] += 1
+        if cache is not None:
+            traffic[plan_key] = cache.traffic()
+    return histograms, demand_union, token_counts, traffic
 
 
 def _rank_nonresident(frequency: Any, mask: Any) -> Any:
@@ -291,8 +344,9 @@ def _accumulate(
     histograms: dict[HistKey, Any],
     demand_union: dict[PlanKey, int],
     token_counts: dict[PlanKey, int],
+    traffic: dict[PlanKey, dict],
 ) -> None:
-    """Fold one layer's histograms and counters into the run accumulator."""
+    """Fold one layer's histograms, counters and cache traffic into the run."""
     for key, value in histograms.items():
         current = total["hist"].get(key)
         total["hist"][key] = value if current is None else current + value
@@ -300,6 +354,15 @@ def _accumulate(
         total["union"][key] = total["union"].get(key, 0) + int(value)
     for key, value in token_counts.items():
         total["tokens"][key] = total["tokens"].get(key, 0) + int(value)
+    for plan_key, by_ratio in traffic.items():
+        aggregate = total["traffic"].setdefault(plan_key, {})
+        for ratio, stats in by_ratio.items():
+            current = aggregate.setdefault(
+                ratio, {"loads": 0, "evictions": 0, "resident": 0}
+            )
+            current["loads"] += int(stats["loads"])
+            current["evictions"] += int(stats["evictions"])
+            current["resident"] += int(stats["resident"])
 
 
 def finalize(
@@ -316,15 +379,15 @@ def finalize(
     histograms = total["hist"]
     ordering = sorted(
         histograms,
-        key=lambda key: (key[0], key[1], key[2], key[3], key[4]),
+        key=lambda key: (key[0], key[1], key[2], key[3], key[4], key[5]),
     )
     rows: list[dict[str, Any]] = []
     combos: dict[str, Any] = {}
     for key in ordering:
-        split, portion, chunk_size, ratio, fetch = key
+        split, portion, chunk_size, ratio, policy, fetch = key
         counts = histograms[key]
         total_count = int(counts.sum())
-        combos[f"{split}|{portion}|{chunk_size}|{ratio}|{fetch}"] = (
+        combos[f"{split}|{portion}|{chunk_size}|{ratio}|{policy}|{fetch}"] = (
             distribution_stats(counts)
         )
         cumulative = 0
@@ -339,6 +402,7 @@ def finalize(
                     "decode_portion": portion,
                     "chunk_size": chunk_size,
                     "ratio": ratio,
+                    "policy": policy,
                     "fetch": fetch,
                     "missing": missing,
                     "count": count,
@@ -356,6 +420,11 @@ def finalize(
         denom = max(tokens * int(dims["top_k"]), 1)
         uniqueness[f"{split}|{portion}|{chunk_size}"] = round(union / denom, 6)
 
+    traffic = {
+        f"{split}|{portion}|{chunk_size}": by_ratio
+        for (split, portion, chunk_size), by_ratio in sorted(total["traffic"].items())
+    }
+
     summary = {
         "run_id": run_id,
         "created_at": utc_now(),
@@ -366,7 +435,9 @@ def finalize(
         "skipped_layers": skipped,
         "n_experts": int(dims["n_experts"]),
         "top_k": int(dims["top_k"]),
+        "policies": [str(policy) for policy in cfg["simulation"]["policies"]],
         "combos": combos,
+        "traffic": traffic,
         "diagnostics": {
             f"{split}|{portion}|{chunk_size}": stats
             for (split, portion, chunk_size), stats in sorted(

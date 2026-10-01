@@ -35,6 +35,13 @@ simulation:
   fetch_counts: [0, 8, 10, 20, 40]
   # Static hot-set sizes, as ratios of the 256 experts (matches 4_analysis).
   ready_ratios: [0.25, 0.5, 0.75]
+  # Resident-set policies to sweep. "static" = the fixed hot set, optionally
+  # topped up by the per-chunk speculative fetch below; "cached" = the adaptive
+  # LFU-displacement cache (mirrors 4_analysis), seeded from the hot set and
+  # updated from each chunk's ground-truth demand. The cached policy is an
+  # oracle (it observes the true routed experts), so it upper-bounds any
+  # prediction-driven loader.
+  policies: [static, cached]
   # Per-token top-k of (score + bias) used to build the frequency table.
   prediction_k: 6
   apply_bias: true # select with the reference gate's per-layer bias

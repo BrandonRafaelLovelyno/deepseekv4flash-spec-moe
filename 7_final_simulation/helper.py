@@ -33,6 +33,7 @@ READY_RATIOS = (0.25, 0.5, 0.75)
 INPUT_KINDS = ("compressed", "expanded")
 DISPERSALS = ("van_der_corput",)
 PREFILL_ORDERS = ("sequential_per_session",)
+CACHE_POLICIES = ("static", "cached")
 
 CONFIG_DEFAULTS: dict[str, Any] = {
     "seed": 0,
@@ -45,6 +46,11 @@ CONFIG_DEFAULTS: dict[str, Any] = {
         "decode_portions": [0.75, 0.5, 0.125],
         "fetch_counts": [0, 8, 10, 20, 40],
         "ready_ratios": [0.25, 0.5, 0.75],
+        # Which resident-set policies to sweep. "static" is the fixed hot set
+        # optionally topped up by a per-chunk speculative fetch; "cached" is the
+        # adaptive LFU-displacement cache (see AdaptiveCache) seeded from the hot
+        # set and updated from each chunk's ground-truth demand.
+        "policies": ["static", "cached"],
         "prediction_k": 6,
         "apply_bias": True,
         "primary_fetch": 20,
@@ -100,6 +106,10 @@ def load_config(config_text: str) -> dict[str, Any]:
         not 0.0 < float(r) < 1.0 for r in sim["ready_ratios"]
     ):
         raise ValueError("simulation.ready_ratios must be fractions in (0, 1)")
+    if not sim["policies"] or any(
+        policy not in CACHE_POLICIES for policy in sim["policies"]
+    ):
+        raise ValueError(f"simulation.policies must be a subset of {CACHE_POLICIES}")
     if int(sim["prediction_k"]) < 1:
         raise ValueError("simulation.prediction_k must be >= 1")
     if int(sim["primary_fetch"]) < 0:
@@ -449,6 +459,96 @@ def resident_masks(
         masks[float(ratio)] = mask
         k_by_ratio[float(ratio)] = k
     return masks, k_by_ratio
+
+
+# --------------------------------------------------------------------------- #
+# Adaptive expert cache (mirrors 4_analysis' LFU-displacement cache)
+# --------------------------------------------------------------------------- #
+class AdaptiveCache:
+    """Per-ratio LFU expert cache for a single layer, seeded from the hot set.
+
+    Ported from ``4_analysis.AdaptiveCache`` to one layer (the simulation sweeps
+    layers one at a time). Every ratio owns an independent, fixed-capacity
+    (``k = round(ratio * n_experts)``) resident set. Observing one forward pass
+    (here, one chunk):
+
+    1. records the miss count against the *current* resident set,
+    2. credits +1 frequency to every demanded expert,
+    3. evicts the coldest residents to make room for the newly demanded ones
+       (pure displacement -- no admission control).
+
+    Ties on frequency are broken by training rank (hotter stays). Capacity is
+    preserved exactly, so the cache holds the same number of experts as the
+    static ``masks`` it replaces.
+    """
+
+    def __init__(
+        self,
+        masks: dict[float, Any],
+        counts: Any,
+        k_by_ratio: dict[float, int],
+        ratios: tuple[float, ...],
+        n_experts: int,
+    ) -> None:
+        import numpy as np
+
+        self.ratios = tuple(float(ratio) for ratio in ratios)
+        self.n_experts = int(n_experts)
+        self.k_by_ratio = {float(ratio): int(k) for ratio, k in k_by_ratio.items()}
+        self.k = np.array([self.k_by_ratio[r] for r in self.ratios], dtype=np.int64)
+        # State is stacked on a leading ratio axis: [R, E].
+        self.resident = np.stack([masks[r].copy() for r in self.ratios])
+        self.freq = np.zeros((len(self.ratios), n_experts), dtype=np.int64)
+        self.train_rank = np.empty(n_experts, dtype=np.int64)
+        order = np.argsort(np.asarray(counts, dtype=np.int64))[::-1]
+        self.train_rank[order] = np.arange(n_experts, dtype=np.int64)
+        # Single-integer encoding of the (missing, freq, train rank) priority, so
+        # the top-k set is taken with one argpartition instead of a full lexsort.
+        self._key_offset = np.int64(1) << 40
+        self._rank_bonus = (n_experts - 1) - self.train_rank
+        self.loads = {r: 0 for r in self.ratios}
+        self.evictions = {r: 0 for r in self.ratios}
+
+    def observe_mask(self, demand: Any) -> Any:
+        """Observe one forward pass for every ratio; return miss counts ``[R]``.
+
+        ``demand`` is a boolean ``[n_experts]`` set of demanded experts. Each
+        ratio updates its own independent resident set. Keep priority is
+        missing experts first, then higher frequency, then hotter training rank,
+        expressed as one integer key so ``argpartition`` selects top-k directly.
+        """
+        import numpy as np
+
+        resident = self.resident
+        is_missing = demand[None, :] & ~resident  # [R, E]
+        miss = is_missing.sum(axis=1).astype(np.int64)  # [R]
+        self.freq += demand
+        key = (
+            is_missing.astype(np.int64) * self._key_offset
+            + self.freq * self.n_experts
+            + self._rank_bonus
+        )  # [R, E]
+        new = np.zeros_like(resident)
+        for ri in range(len(self.ratios)):
+            k = int(self.k[ri])
+            idx = np.argpartition(key[ri], -k)[-k:]
+            new[ri, idx] = True
+        for ri, ratio in enumerate(self.ratios):
+            self.loads[ratio] += int((new[ri] & ~resident[ri]).sum())
+            self.evictions[ratio] += int((resident[ri] & ~new[ri]).sum())
+        self.resident = new
+        return miss
+
+    def traffic(self) -> dict[str, dict[str, int]]:
+        """Per-ratio cumulative load/eviction counts and resident size."""
+        return {
+            str(ratio): {
+                "loads": self.loads[ratio],
+                "evictions": self.evictions[ratio],
+                "resident": int(self.resident[ri].sum()),
+            }
+            for ri, ratio in enumerate(self.ratios)
+        }
 
 
 def _percentile(portion: Any, target: float) -> int:
