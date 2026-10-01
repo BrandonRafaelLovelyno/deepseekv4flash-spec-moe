@@ -1,0 +1,40 @@
+# Config for 8_article_writing/average_used_experts: the average number of
+# distinct routed experts a prefill chunk activates, per chunk token limit and
+# per layer, under a mixed chunked-prefill load.
+#
+# Copy this to config.yaml (gitignored) and edit; re-run with:
+#     modal run 8_article_writing/average_used_experts/main.py
+#
+# Every field below is optional -- omitted fields fall back to the values shown
+# here (see CONFIG_DEFAULTS in helper.py).
+
+seed: 0
+
+cache:
+  dir: /cache # volume holding the re-laid-out per-layer cache
+
+harvest:
+  dir: /harvest # volume holding the raw harvest (for is_decode labels)
+
+data:
+  split: [train, test] # both splits are replayed in full
+  layers: null # null = every layer present in the cache, or e.g. [20, 21, 22]
+
+simulation:
+  # Token budget per chunk (decode + prefill tokens combined) -- the prefill
+  # chunk token limits being compared.
+  chunk_sizes: [16, 32, 64, 128, 256, 512, 1024]
+  # Fraction of each chunk's budget spent on concurrent decode tokens; the rest
+  # is the next prefill tokens of a request. Three load regimes.
+  decode_portions: [0.75, 0.5, 0.125]
+  # Decode dispersal: repeated visits to a session land far apart in the
+  # document (balanced rotation + van der Corput positions).
+  decode_dispersal: van_der_corput
+  # Prefill order: each chunk's prefill is consecutive tokens of one request.
+  prefill_order: sequential_per_session
+  # Decode portion whose per-layer heatmap is drawn (snapped to the nearest
+  # configured decode_portions value).
+  primary_portion: 0.5
+
+output:
+  volume_dir: /article # Modal volume mount for artifacts
