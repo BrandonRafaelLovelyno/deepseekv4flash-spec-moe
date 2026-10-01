@@ -1,5 +1,5 @@
 # Config for 8_article_writing/average_used_experts: the average number of
-# distinct routed experts a prefill chunk activates, per chunk token limit and
+# distinct routed experts a prefill chunk activates, per chunk size and
 # per layer, under a mixed chunked-prefill load.
 #
 # Copy this to config.yaml (gitignored) and edit; re-run with:
@@ -22,7 +22,7 @@ data:
 
 simulation:
   # Token budget per chunk (decode + prefill tokens combined) -- the prefill
-  # chunk token limits being compared.
+  # chunk sizes being compared.
   chunk_sizes: [16, 32, 64, 128, 256, 512, 1024]
   # Fraction of each chunk's budget spent on concurrent decode tokens; the rest
   # is the next prefill tokens of a request. Three load regimes.

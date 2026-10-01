@@ -72,69 +72,58 @@ def _by_layer(
 
 
 def mean_distinct_vs_chunk_png(payload: dict[str, Any]) -> bytes:
-    """Mean distinct experts vs chunk size: lines = decode portions, band = layers."""
+    """Mean distinct experts vs chunk size: lines = decode portions, band = layers.
+
+    Train and test are merged into one panel with equal weight per split (see
+    ``usage.finalize``'s ``merged`` series).
+    """
     import matplotlib.pyplot as plt
-    import numpy as np
 
     summary = payload["summary"]
-    rows = payload["rows"]
-    by_layer = _by_layer(rows)
-    splits = _splits(summary)
-    portions = sorted({float(key.split("|")[1]) for key in summary["combos"]})
+    merged = summary["merged"]
+    portions = sorted({float(key.split("|")[0]) for key in merged})
     chunk_sizes = summary["chunk_sizes"]
     n_experts = int(summary["n_experts"])
-    top_k = int(summary["top_k"])
 
     with plt.rc_context(_style()):
-        fig, axes = plt.subplots(
-            1, len(splits), figsize=(6.4 * len(splits), 4.8), squeeze=False
-        )
-        for ax, split in zip(axes.ravel(), splits):
-            for portion in portions:
-                xs: list[int] = []
-                mean: list[float] = []
-                low: list[float] = []
-                high: list[float] = []
-                for size in chunk_sizes:
-                    values = list(by_layer.get((split, portion, size), {}).values())
-                    if not values:
-                        continue
-                    values_arr = np.asarray(values, dtype=np.float64)
-                    xs.append(size)
-                    mean.append(float(values_arr.mean()))
-                    low.append(float(np.percentile(values_arr, 10)))
-                    high.append(float(np.percentile(values_arr, 90)))
-                color = PORTION_COLORS.get(portion, "#666666")
-                ax.plot(
-                    xs, mean, "-o", color=color, linewidth=2.0, markersize=4,
-                    label=f"{int(round(portion * 100))}% decode",
-                )
-                ax.fill_between(xs, low, high, color=color, alpha=0.12, linewidth=0)
+        fig, ax = plt.subplots(figsize=(7.6, 4.8))
+        for portion in portions:
+            xs: list[int] = []
+            mean: list[float] = []
+            low: list[float] = []
+            high: list[float] = []
+            for size in chunk_sizes:
+                stats = merged.get(f"{portion}|{size}")
+                if stats is None:
+                    continue
+                xs.append(size)
+                mean.append(float(stats["layer_mean_distinct"]))
+                low.append(float(stats["layer_p10"]))
+                high.append(float(stats["layer_p90"]))
+            color = PORTION_COLORS.get(portion, "#666666")
             ax.plot(
-                chunk_sizes, [min(size * top_k, n_experts) for size in chunk_sizes],
-                ":", color="#888888", linewidth=1.4, label="no reuse (B \u00b7 k)",
+                xs, mean, "-o", color=color, linewidth=2.0, markersize=4,
+                label=f"{int(round(portion * 100))}% decode",
             )
-            ax.axhline(
-                n_experts, color="#888888", linestyle="--", linewidth=1.2
-            )
-            ax.text(
-                chunk_sizes[-1], n_experts, f" all {n_experts} experts",
-                va="bottom", ha="right", fontsize=9, color="#666666",
-            )
-            ax.set_title(f"{split} split")
-            ax.set_xscale("log", base=2)
-            ax.set_xticks(chunk_sizes)
-            ax.set_xticklabels([str(size) for size in chunk_sizes])
-            ax.set_xlabel("Prefill chunk token limit")
-            ax.grid(True, color=GRID, linewidth=0.6, alpha=0.8)
-            ax.set_axisbelow(True)
-        axes.ravel()[0].set_ylabel("Mean distinct experts per chunk")
-        axes.ravel()[-1].legend(loc="lower right", frameon=False)
-        fig.suptitle(
-            "Distinct routed experts activated by one prefill chunk",
-            fontsize=15, fontweight="600",
+            ax.fill_between(xs, low, high, color=color, alpha=0.12, linewidth=0)
+        ax.axhline(n_experts, color="#888888", linestyle="--", linewidth=1.2)
+        ax.text(
+            chunk_sizes[-1], n_experts, f" all {n_experts} experts",
+            va="bottom", ha="right", fontsize=9, color="#666666",
         )
-        fig.tight_layout(rect=(0, 0, 1, 0.95))
+        ax.set_title(
+            "Distinct routed experts activated by one prefill chunk",
+            fontsize=14, fontweight="bold",
+        )
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(chunk_sizes)
+        ax.set_xticklabels([str(size) for size in chunk_sizes])
+        ax.set_xlabel("Prefill chunk size")
+        ax.set_ylabel("Mean distinct experts per chunk")
+        ax.grid(True, color=GRID, linewidth=0.6, alpha=0.8)
+        ax.set_axisbelow(True)
+        ax.legend(loc="lower right", frameon=False)
+        fig.tight_layout()
         return _figure_bytes(fig)
 
 
@@ -168,7 +157,7 @@ def layer_heatmap_png(payload: dict[str, Any], portion: float) -> bytes:
             ax.set_title(f"{split} split")
             ax.set_xticks(range(len(chunk_sizes)))
             ax.set_xticklabels([str(size) for size in chunk_sizes])
-            ax.set_xlabel("Prefill chunk token limit")
+            ax.set_xlabel("Prefill chunk size")
             step = max(len(layers) // 10, 1)
             ax.set_yticks(range(0, len(layers), step))
             ax.set_yticklabels([str(layers[i]) for i in range(0, len(layers), step)])
@@ -183,7 +172,7 @@ def layer_heatmap_png(payload: dict[str, Any], portion: float) -> bytes:
         fig.suptitle(
             f"Mean distinct experts per chunk, layer by layer "
             f"({int(round(portion * 100))}% decode)",
-            fontsize=15, fontweight="600",
+            fontsize=15, fontweight="bold",
         )
         return _figure_bytes(fig)
 

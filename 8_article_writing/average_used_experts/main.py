@@ -1,8 +1,8 @@
-"""Average distinct experts per prefill chunk, per chunk token limit and layer.
+"""Average distinct experts per prefill chunk, per chunk size and layer.
 
 The article companion to ``7_final_simulation``: instead of predicting and
 schooling a resident set, it measures the *ground truth* of speculative expert
-loading -- for each chunk token limit ``B`` (and each decode portion of a mixed
+loading -- for each chunk size ``B`` (and each decode portion of a mixed
 chunked-prefill load), how many distinct routed experts a chunk's tokens
 activate together, averaged over chunks and reported per layer.
 

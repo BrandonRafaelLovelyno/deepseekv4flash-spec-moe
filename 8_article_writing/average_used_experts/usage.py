@@ -4,7 +4,7 @@ This is the whole analysis. It reuses ``7_final_simulation``'s plan build and
 replay *without* the predictor: for every ``(split, decode_portion, chunk_size)``
 chunk plan it walks each layer's cached truth top-k and, per chunk, counts the
 **distinct routed experts** the chunk's tokens activate together. The run summary
-reports that count averaged over chunks, per chunk token limit and per layer --
+reports that count averaged over chunks, per chunk size and per layer --
 the true per-batch expert working set that speculative loading must fit in VRAM.
 
 numpy is imported inside functions so the local entrypoint can import this module
@@ -254,6 +254,28 @@ def finalize(
         pooled["layer_p90"] = round(float(np.percentile(means, 90)), 6)
         combos[f"{split}|{portion}|{chunk_size}"] = pooled
 
+    # Equal-weight-per-split merge for the single-panel article line chart: each
+    # split contributes 50%, so per-layer means are averaged across splits before
+    # the across-layer band is taken. Per-split detail stays in ``rows``/``combos``.
+    merged_values: dict[tuple[float, int], dict[int, list[float]]] = {}
+    for row in rows:
+        group = merged_values.setdefault(
+            (float(row["decode_portion"]), int(row["chunk_size"])), {}
+        )
+        group.setdefault(int(row["layer"]), []).append(float(row["mean_distinct"]))
+    merged: dict[str, Any] = {}
+    for (portion, chunk_size), by_layer in sorted(merged_values.items()):
+        per_layer = np.asarray(
+            [float(np.mean(values)) for _, values in sorted(by_layer.items())],
+            dtype=np.float64,
+        )
+        merged[f"{portion}|{chunk_size}"] = {
+            "n_layers": int(per_layer.shape[0]),
+            "layer_mean_distinct": round(float(per_layer.mean()), 6),
+            "layer_p10": round(float(np.percentile(per_layer, 10)), 6),
+            "layer_p90": round(float(np.percentile(per_layer, 90)), 6),
+        }
+
     histograms = {
         f"{split}|{portion}|{chunk_size}|L{layer}": hist
         for (split, portion, chunk_size, layer), hist in total["hist"].items()
@@ -270,6 +292,7 @@ def finalize(
         "top_k": top_k,
         "chunk_sizes": sorted(int(b) for b in cfg["simulation"]["chunk_sizes"]),
         "combos": combos,
+        "merged": merged,
         "diagnostics": {
             f"{split}|{portion}|{chunk_size}": stats
             for (split, portion, chunk_size), stats in sorted(

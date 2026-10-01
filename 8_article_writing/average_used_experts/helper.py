@@ -1,6 +1,6 @@
 """Config, cache/harvest access and shared statistics.
 
-This stage measures, for each prefill chunk token limit and each MoE layer, the
+This stage measures, for each prefill chunk size and each MoE layer, the
 average number of **distinct routed experts** the chunk's tokens activate
 together (the union of every token's top-k). It reads only the ground-truth top-k
 and the ``is_decode`` labels that ``7_final_simulation`` already replays -- no
