@@ -4,3 +4,4 @@ config.yaml
 checkpoints/
 fonts/
 **/*.png
+input/
