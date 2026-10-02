@@ -6,8 +6,9 @@ Each ``output/<run_id>/`` directory is one full train-all run: a ``summary.json`
 metric). This module discovers those runs, keeps the MLP ones, reshapes the
 tables into a tidy per-``(layer, distance, ratio)`` form the plotter consumes,
 and derives the chosen per-layer real look-ahead distance (the furthest distance
-clearing ``RECALL_TARGET``, else the nearest), clamped to the layer index so an
-early layer never reports more lead time than it physically has.
+clearing ``RECALL_TARGET``, else the best-recall distance with ties to the
+furthest), clamped to the layer index so an early layer never reports more lead
+time than it physically has.
 
 Only the standard library is imported at module scope, so ``main.py`` stays
 importable on a machine without the scientific stack.
@@ -28,8 +29,8 @@ KS = 8
 RATIOS = (0.5, 0.75)
 
 # Per-layer look-ahead selection: prefer the furthest distance (most lead time)
-# that still clears this ready-recall bar; fall back to the nearest distance when
-# no distance reaches it.
+# that still clears this ready-recall bar; when no distance reaches it, fall back
+# to the distance with the best recall, breaking ties toward the furthest.
 RECALL_TARGET = 0.9
 
 
@@ -126,10 +127,11 @@ def choose_distances(
     """The chosen real look-ahead distance per layer for one metric.
 
     The furthest ``distance`` whose ready recall meets ``target`` wins, so the
-    predictor gives the loader as much lead time as that layer can afford; when
-    no distance reaches the bar, the nearest (smallest) distance is used. The
-    winner is then clamped to the layer index, since layer ``L`` can read back
-    at most ``L`` layers, so the value reflects the real lead time.
+    predictor gives the loader as much lead time as that layer can afford. When
+    no distance reaches the bar, the distance with the best recall is used,
+    breaking ties toward the furthest. The winner is then clamped to the layer
+    index, since layer ``L`` can read back at most ``L`` layers, so the value
+    reflects the real lead time.
     """
     by_layer: dict[int, dict[int, float]] = {}
     for row in rows:
@@ -137,7 +139,11 @@ def choose_distances(
     chosen: dict[int, int] = {}
     for layer, values in by_layer.items():
         qualified = [d for d in distances if values.get(d, float("-inf")) >= target]
-        winner = max(qualified) if qualified else min(distances)
+        if qualified:
+            winner = max(qualified)
+        else:
+            best = max(values.get(d, float("-inf")) for d in distances)
+            winner = max(d for d in distances if values.get(d, float("-inf")) == best)
         chosen[layer] = real_distance(layer, winner)
     return chosen
 
