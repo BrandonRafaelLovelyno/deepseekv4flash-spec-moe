@@ -4,8 +4,9 @@ The article companion to ``6_train_all``: it reads the finished per-layer runs
 placed under ``input/`` and plots ready recall at 8 experts fetched per token,
 layer by layer, for each look-ahead distance. For the 50% and 75% resident
 ratios it renders both a grouped-bar view (x = layer, one bar per distance) and
-a line view (one line per distance across depth), plus a single look-ahead
-distance-choice figure showing which distance each layer selects.
+a line view (one line per distance across depth), plus a single real look-ahead
+distance-choice figure showing the lead time each layer actually selects (the
+chosen distance clamped to the layer index).
 
 Inputs are the run directories themselves, so this stage is CPU only -- no
 predictor, no GPU, no training run. It discovers every MLP run under ``input/``,
@@ -45,9 +46,9 @@ def write_rows(path: str, rows: list[dict[str, Any]], metrics: dict[float, str])
 
 
 def write_choices(path: str, payload: dict[str, Any]) -> None:
-    """Write the chosen per-layer look-ahead distance, one column per ratio."""
+    """Write the chosen per-layer real look-ahead distance, one column per ratio."""
     ratios = list(payload["metrics"])
-    columns = ["layer"] + [f"r{round(ratio * 100)}_choice" for ratio in ratios]
+    columns = ["layer"] + [f"r{round(ratio * 100)}_real_choice" for ratio in ratios]
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(",".join(columns) + "\n")
         for layer in payload["layers"]:
@@ -86,7 +87,7 @@ def print_report(payload: dict[str, Any]) -> None:
         f"(clamped below {payload['clamped_below']})  "
         f"distances: {payload['distances']}"
     )
-    for metric in payload["metrics"].values():
+    for ratio, metric in payload["metrics"].items():
         print(f"\nmean {metric} (layer mean):")
         for distance in payload["distances"]:
             values = [
@@ -104,6 +105,11 @@ def print_report(payload: dict[str, Any]) -> None:
                 f"  distance {distance}: {_mean(values):.4f}  "
                 f"(layers>={payload['clamped_below']}: {_mean(effective):.4f})"
             )
+        chosen = list(payload["choices"][ratio].values())
+        print(
+            f"  real look-ahead distance (layer mean): {_mean(chosen):.2f}  "
+            f"(min {min(chosen)}, max {max(chosen)})"
+        )
 
 
 def main() -> None:

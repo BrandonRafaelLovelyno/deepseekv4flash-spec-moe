@@ -5,8 +5,9 @@ Each ``output/<run_id>/`` directory is one full train-all run: a ``summary.json`
 ``layers.csv`` (one row per MoE layer, carrying every ``ready_recall_*@k``
 metric). This module discovers those runs, keeps the MLP ones, reshapes the
 tables into a tidy per-``(layer, distance, ratio)`` form the plotter consumes,
-and derives the chosen per-layer look-ahead distance (the furthest distance
-clearing ``RECALL_TARGET``, else the nearest).
+and derives the chosen per-layer real look-ahead distance (the furthest distance
+clearing ``RECALL_TARGET``, else the nearest), clamped to the layer index so an
+early layer never reports more lead time than it physically has.
 
 Only the standard library is imported at module scope, so ``main.py`` stays
 importable on a machine without the scientific stack.
@@ -111,17 +112,24 @@ def layers(rows: list[dict[str, Any]]) -> list[int]:
     return sorted({row["layer"] for row in rows})
 
 
+def real_distance(layer: int, distance: int) -> int:
+    """The lead time a layer actually gets: it cannot look further than itself."""
+    return min(layer, distance)
+
+
 def choose_distances(
     rows: list[dict[str, Any]],
     metric: str,
     distances: list[int],
     target: float = RECALL_TARGET,
 ) -> dict[int, int]:
-    """The chosen look-ahead distance per layer for one metric.
+    """The chosen real look-ahead distance per layer for one metric.
 
     The furthest ``distance`` whose ready recall meets ``target`` wins, so the
     predictor gives the loader as much lead time as that layer can afford; when
-    no distance reaches the bar, the nearest (smallest) distance is used.
+    no distance reaches the bar, the nearest (smallest) distance is used. The
+    winner is then clamped to the layer index, since layer ``L`` can read back
+    at most ``L`` layers, so the value reflects the real lead time.
     """
     by_layer: dict[int, dict[int, float]] = {}
     for row in rows:
@@ -129,7 +137,8 @@ def choose_distances(
     chosen: dict[int, int] = {}
     for layer, values in by_layer.items():
         qualified = [d for d in distances if values.get(d, float("-inf")) >= target]
-        chosen[layer] = max(qualified) if qualified else min(distances)
+        winner = max(qualified) if qualified else min(distances)
+        chosen[layer] = real_distance(layer, winner)
     return chosen
 
 
