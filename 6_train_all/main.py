@@ -102,7 +102,7 @@ def build_cache(config_text: str) -> dict:
 
 
 # Concurrent-GPU cap: at most this many per-layer containers run at once.
-MAX_PARALLEL = 24
+MAX_PARALLEL = 8
 
 
 @app.function(
