@@ -4,7 +4,8 @@ The article companion to ``6_train_all``: it reads the finished per-layer runs
 placed under ``input/`` and plots ready recall at 8 experts fetched per token,
 layer by layer, for each look-ahead distance. For the 50% and 75% resident
 ratios it renders both a grouped-bar view (x = layer, one bar per distance) and
-a line view (one line per distance across depth).
+a line view (one line per distance across depth), plus a single look-ahead
+distance-choice figure showing which distance each layer selects.
 
 Inputs are the run directories themselves, so this stage is CPU only -- no
 predictor, no GPU, no training run. It discovers every MLP run under ``input/``,
@@ -43,16 +44,30 @@ def write_rows(path: str, rows: list[dict[str, Any]], metrics: dict[float, str])
             handle.write(",".join(cells) + "\n")
 
 
+def write_choices(path: str, payload: dict[str, Any]) -> None:
+    """Write the chosen per-layer look-ahead distance, one column per ratio."""
+    ratios = list(payload["metrics"])
+    columns = ["layer"] + [f"r{round(ratio * 100)}_choice" for ratio in ratios]
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(",".join(columns) + "\n")
+        for layer in payload["layers"]:
+            cells = [str(layer)] + [
+                str(payload["choices"][ratio][layer]) for ratio in ratios
+            ]
+            handle.write(",".join(cells) + "\n")
+
+
 def write_artifacts(payload: dict[str, Any]) -> list[str]:
-    """Render the figures, write them and the CSV; return the written names."""
+    """Render the figures, write them and the CSVs; return the written names."""
     os.makedirs(OUT_DIR, exist_ok=True)
     figures = plots.build_figures(payload)
-    written = ["recall_by_distance.csv"]
+    written = ["recall_by_distance.csv", "lookahead_choice_by_layer.csv"]
     write_rows(
         os.path.join(OUT_DIR, "recall_by_distance.csv"),
         payload["rows"],
         payload["metrics"],
     )
+    write_choices(os.path.join(OUT_DIR, "lookahead_choice_by_layer.csv"), payload)
     for name, data in figures.items():
         with open(os.path.join(OUT_DIR, name), "wb") as handle:
             handle.write(data)

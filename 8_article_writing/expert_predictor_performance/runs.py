@@ -3,8 +3,10 @@
 Each ``output/<run_id>/`` directory is one full train-all run: a ``summary.json``
 (whose ``config.task.distance`` and ``config.model.arch`` describe the run) and a
 ``layers.csv`` (one row per MoE layer, carrying every ``ready_recall_*@k``
-metric). This module discovers those runs, keeps the MLP ones, and reshapes the
-tables into a tidy per-``(layer, distance, ratio)`` form the plotter consumes.
+metric). This module discovers those runs, keeps the MLP ones, reshapes the
+tables into a tidy per-``(layer, distance, ratio)`` form the plotter consumes,
+and derives the chosen per-layer look-ahead distance (the furthest distance
+clearing ``RECALL_TARGET``, else the nearest).
 
 Only the standard library is imported at module scope, so ``main.py`` stays
 importable on a machine without the scientific stack.
@@ -23,6 +25,11 @@ INPUT_DIR = os.path.join(THIS_DIR, "input")
 ARCH = "mlp"
 KS = 8
 RATIOS = (0.5, 0.75)
+
+# Per-layer look-ahead selection: prefer the furthest distance (most lead time)
+# that still clears this ready-recall bar; fall back to the nearest distance when
+# no distance reaches it.
+RECALL_TARGET = 0.9
 
 
 def _metric(ratio: float, k: int = KS) -> str:
@@ -104,6 +111,28 @@ def layers(rows: list[dict[str, Any]]) -> list[int]:
     return sorted({row["layer"] for row in rows})
 
 
+def choose_distances(
+    rows: list[dict[str, Any]],
+    metric: str,
+    distances: list[int],
+    target: float = RECALL_TARGET,
+) -> dict[int, int]:
+    """The chosen look-ahead distance per layer for one metric.
+
+    The furthest ``distance`` whose ready recall meets ``target`` wins, so the
+    predictor gives the loader as much lead time as that layer can afford; when
+    no distance reaches the bar, the nearest (smallest) distance is used.
+    """
+    by_layer: dict[int, dict[int, float]] = {}
+    for row in rows:
+        by_layer.setdefault(row["layer"], {})[row["distance"]] = float(row[metric])
+    chosen: dict[int, int] = {}
+    for layer, values in by_layer.items():
+        qualified = [d for d in distances if values.get(d, float("-inf")) >= target]
+        chosen[layer] = max(qualified) if qualified else min(distances)
+    return chosen
+
+
 def load(input_dir: str = INPUT_DIR, arch: str = ARCH) -> dict[str, Any]:
     """Discover the runs and assemble the payload the figure builder consumes."""
     runs = list_runs(input_dir, arch=arch)
@@ -113,11 +142,17 @@ def load(input_dir: str = INPUT_DIR, arch: str = ARCH) -> dict[str, Any]:
             "run 6_train_all first"
         )
     rows = load_rows(runs)
+    distances = [run["distance"] for run in runs]
     return {
         "rows": rows,
         "runs": runs,
-        "distances": [run["distance"] for run in runs],
+        "distances": distances,
         "metrics": METRICS,
+        "choices": {
+            ratio: choose_distances(rows, metric, distances)
+            for ratio, metric in METRICS.items()
+        },
+        "recall_target": RECALL_TARGET,
         "clamped_below": clamped_below(rows),
         "layers": layers(rows),
     }
