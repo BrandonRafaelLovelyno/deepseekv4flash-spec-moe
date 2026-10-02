@@ -29,24 +29,23 @@ from helper import (
     load_config,
     load_harvest_manifest,
     load_prediction_manifest,
-    load_run_summary,
     prediction_dir,
     prediction_fingerprint,
     read_cached_expert_counts,
     read_cached_prediction,
     read_cached_topk,
     resident_masks,
-    resolve_layers,
-    resolve_run_dir,
+    resolve_profile,
     utc_now,
 )
+from reporting import print_profile_report
 
 HistKey = tuple[str, float, int, float, str, int]
 PlanKey = tuple[str, float, int]
 
 
 def simulate(
-    config_text: str, run_id: str, training_run_id: str = ""
+    config_text: str, run_id: str, profile_id: str = ""
 ) -> dict[str, Any]:
     """Sweep every layer against the cached predictions (CPU only)."""
     cfg = load_config(config_text)
@@ -57,25 +56,23 @@ def simulate(
     harvest_manifest = load_harvest_manifest(cfg["harvest"]["dir"])
     dims = cache_dims(cache_manifest)
 
-    run_dir, resolved_id = resolve_run_dir(
-        cfg["training"]["dir"], training_run_id or cfg["training"]["run_id"]
-    )
-    run_summary = load_run_summary(run_dir)
-    metas, skipped = resolve_layers(cfg, run_dir, run_summary, dims)
+    metas, skipped, resolved_id, profile_desc = resolve_profile(cfg, dims)
+    print_profile_report(profile_desc)
+    cache_id = profile_id or resolved_id
 
     splits = [str(split) for split in cfg["data"]["split"]]
     plans, diagnostics = build_plans(cfg, cache_manifest, harvest_manifest, splits)
     if not plans:
         raise ValueError("no chunk plans built; check the harvest manifest and splits")
 
-    pred_dir = prediction_dir(cfg["output"]["volume_dir"], resolved_id)
-    validate_predictions(cfg, cache_manifest, resolved_id, metas, pred_dir)
+    pred_dir = prediction_dir(cfg["output"]["volume_dir"], cache_id)
+    validate_predictions(cfg, cache_manifest, cache_id, metas, pred_dir)
 
     total: dict[str, dict] = {"hist": {}, "union": {}, "tokens": {}, "traffic": {}}
     for index, meta in enumerate(metas, start=1):
         print(
             f"[sim] layer {index}/{len(metas)} L{meta['layer']:02d} "
-            f"src=L{meta['source_layer']:02d}",
+            f"d={meta['distance']} src=L{meta['source_layer']:02d}",
             flush=True,
         )
         layer_splits = sorted({key[0] for key in plans})
@@ -89,7 +86,15 @@ def simulate(
         _accumulate(total, hist, union, tokens, traffic)
 
     return finalize(
-        cfg, run_id, resolved_id, metas, skipped, dims, total, diagnostics
+        cfg,
+        run_id,
+        resolved_id,
+        profile_desc,
+        metas,
+        skipped,
+        dims,
+        total,
+        diagnostics,
     )
 
 
@@ -99,14 +104,14 @@ def simulate(
 def validate_predictions(
     cfg: dict[str, Any],
     cache_manifest: dict[str, Any],
-    training_run_id: str,
+    profile_id: str,
     metas: list[dict[str, Any]],
     pred_dir: str,
 ) -> None:
     """Fail early when the prediction cache is missing or stale.
 
     The sweep is only meaningful if every layer's predictions match the current
-    cache and selection knobs; otherwise tell the caller to run the predict stage.
+    cache and profile; otherwise tell the caller to run the predict stage.
     """
     manifest = load_prediction_manifest(pred_dir)
     if manifest is None:
@@ -114,7 +119,7 @@ def validate_predictions(
             f"no prediction cache at {pred_dir}; run the predict stage first"
         )
     expected = prediction_fingerprint(
-        training_run_id,
+        profile_id,
         cache_manifest,
         int(cfg["simulation"]["prediction_k"]),
         bool(cfg["simulation"]["apply_bias"]),
@@ -368,7 +373,8 @@ def _accumulate(
 def finalize(
     cfg: dict[str, Any],
     run_id: str,
-    training_run_id: str,
+    profile_id: str,
+    profile_desc: dict[str, Any],
     metas: list[dict[str, Any]],
     skipped: list[int],
     dims: dict[str, int],
@@ -425,10 +431,13 @@ def finalize(
         for (split, portion, chunk_size), by_ratio in sorted(total["traffic"].items())
     }
 
+    training_label = profile_desc.get("label") or profile_desc.get("run_id", profile_id)
     summary = {
         "run_id": run_id,
         "created_at": utc_now(),
-        "training_run_id": training_run_id,
+        "training_run_id": training_label,
+        "profile_id": profile_id,
+        "distance_profile": profile_desc,
         "config": cfg,
         "n_layers": len(metas),
         "layers": [int(meta["layer"]) for meta in metas],

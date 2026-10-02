@@ -16,14 +16,17 @@ Two stages, split so the GPU is used only where it computes:
 
 The static hot set comes from ``4_analysis``'s per-layer expert counts (the
 ``ready_ratios`` hottest experts); the predictor and its bias come from the
-``6_train_all`` run. Both train and test tokens are replayed. Because the
-prediction cache depends only on the run, cache and selection knobs, re-tuning
-the simulation knobs re-runs the CPU stage alone.
+``6_train_all`` run. Both train and test tokens are replayed. By default every
+layer uses one uniform run (``training.run_id``); setting ``training.
+assignments`` pins each layer to an explicit training run (``run_id -> [layer]``),
+drawing that layer's checkpoint from the named run. Because the prediction cache
+depends only on the resolved profile and cache knobs, re-tuning the simulation
+knobs re-runs the CPU stage alone.
 
 All knobs live in ``7_final_simulation/config.yaml`` (copy
 ``config.example.yaml``). Artifacts land on the
 ``deepseek-v4-flash-simulation`` volume under ``<run_id>/`` (and the prediction
-cache under ``predictions/<training_run_id>/``); run-level files are mirrored to
+cache under ``predictions/<profile_id>/``); run-level files are mirrored to
 ``7_final_simulation/output/<run_id>/``.
 
 Usage:
@@ -111,7 +114,7 @@ def predict_all(config_text: str, force: bool = False) -> dict:
     memory=32 * 1024,
     timeout=4 * 60 * 60,
 )
-def simulate(config_text: str, run_id: str, training_run_id: str = "") -> dict:
+def simulate(config_text: str, run_id: str, profile_id: str = "") -> dict:
     """CPU only: sweep the cached predictions and write the run's artifacts."""
     import matplotlib
 
@@ -121,7 +124,7 @@ def simulate(config_text: str, run_id: str, training_run_id: str = "") -> dict:
     import reporting
     import simulation
 
-    payload = simulation.simulate(config_text, run_id, training_run_id)
+    payload = simulation.simulate(config_text, run_id, profile_id)
     figures = plots.build_figures(payload)
     out_dir = os.path.join(
         payload["summary"]["config"]["output"]["volume_dir"], run_id
@@ -160,7 +163,7 @@ def main(config: str = "", run_id: str = "", force_predict: bool = False) -> Non
     # GPU stage: forward each layer's predictor once, then release the GPU.
     prediction = predict_all.remote(config_text=config_text, force=force_predict)
     print(
-        f"predict: training_run={prediction['training_run_id']} "
+        f"predict: profile={prediction['profile_id']} "
         f"predicted={len(prediction['predicted'])} reused={len(prediction['reused'])}"
     )
 
@@ -168,7 +171,7 @@ def main(config: str = "", run_id: str = "", force_predict: bool = False) -> Non
     result = simulate.remote(
         config_text=config_text,
         run_id=sim_run_id,
-        training_run_id=prediction["training_run_id"],
+        profile_id=prediction["profile_id"],
     )
     out_dir = mirror_run(
         OUT_DIR,

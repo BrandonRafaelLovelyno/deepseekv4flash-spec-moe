@@ -5,9 +5,11 @@ activation from the contiguous cache, forwards the layer's predictor, and writes
 the per-token predicted top-k to a small prediction cache. The CPU sweep
 (``simulation.simulate``) then reads that cache and never touches the GPU.
 
-Predictions depend only on ``(training_run_id, cache, prediction_k, apply_bias)``,
-so the cache is reusable across every simulation knob and is skipped when valid
-unless ``force`` (or ``simulation.force_predict``) is set.
+Predictions depend only on ``(profile_id, cache, prediction_k, apply_bias)`` --
+where ``profile_id`` names the per-layer checkpoint assignment (a uniform run id,
+or a digest of a mixed layer->run map) -- so the cache is reusable across every
+simulation knob and is skipped when valid unless ``force`` (or
+``simulation.force_predict``) is set.
 
 torch / numpy are imported inside functions so the local entrypoint can import
 this module without the GPU stack.
@@ -24,16 +26,16 @@ from helper import (
     load_cache_manifest,
     load_config,
     load_prediction_manifest,
-    load_run_summary,
+    missing_activations,
     prediction_dir,
     prediction_fingerprint,
     read_cached_activation,
     read_cached_bias,
-    resolve_layers,
-    resolve_run_dir,
+    resolve_profile,
     utc_now,
     write_cached_prediction,
 )
+from reporting import print_profile_report
 
 
 def predict_all(config_text: str, force: bool = False) -> dict[str, Any]:
@@ -46,25 +48,28 @@ def predict_all(config_text: str, force: bool = False) -> dict[str, Any]:
         raise ValueError(f"no cache at {cache_dir}; run 6_train_all first")
     dims = cache_dims(cache_manifest)
 
-    run_dir, training_run_id = resolve_run_dir(
-        cfg["training"]["dir"], cfg["training"]["run_id"]
-    )
-    run_summary = load_run_summary(run_dir)
-    metas, skipped = resolve_layers(cfg, run_dir, run_summary, dims)
+    metas, skipped, profile_id, profile_desc = resolve_profile(cfg, dims)
+    print_profile_report(profile_desc)
+    splits = [str(split) for split in cfg["data"]["split"]]
+    missing = missing_activations(cache_manifest, metas, splits)
+    if missing:
+        raise ValueError(
+            f"cache lacks source activations needed by this profile: {missing}; "
+            "run 6_train_all populate_cache for those distances first"
+        )
 
     sim = cfg["simulation"]
     prediction_k = int(sim["prediction_k"])
     apply_bias = bool(sim["apply_bias"])
     fingerprint = prediction_fingerprint(
-        training_run_id, cache_manifest, prediction_k, apply_bias
+        profile_id, cache_manifest, prediction_k, apply_bias
     )
-    pred_dir = prediction_dir(cfg["output"]["volume_dir"], training_run_id)
+    pred_dir = prediction_dir(cfg["output"]["volume_dir"], profile_id)
 
     manifest = load_prediction_manifest(pred_dir)
     fresh = manifest is not None and manifest.get("fingerprint") == fingerprint
     entries = dict(manifest.get("entries", {})) if fresh else {}
 
-    splits = [str(split) for split in cfg["data"]["split"]]
     predicted: list[int] = []
     reused: list[int] = []
     for index, meta in enumerate(metas, start=1):
@@ -75,7 +80,7 @@ def predict_all(config_text: str, force: bool = False) -> dict[str, Any]:
             continue
         print(
             f"[predict] {index}/{len(metas)} L{layer:02d} "
-            f"src=L{meta['source_layer']:02d}",
+            f"d={meta['distance']} src=L{meta['source_layer']:02d}",
             flush=True,
         )
         entries[str(layer)] = {
@@ -96,7 +101,8 @@ def predict_all(config_text: str, force: bool = False) -> dict[str, Any]:
 
     _write_manifest(
         pred_dir,
-        training_run_id,
+        profile_id,
+        profile_desc,
         fingerprint,
         prediction_k,
         apply_bias,
@@ -104,12 +110,13 @@ def predict_all(config_text: str, force: bool = False) -> dict[str, Any]:
         entries,
     )
     print(
-        f"[predict] run={training_run_id} predicted={len(predicted)} "
+        f"[predict] profile={profile_id} predicted={len(predicted)} "
         f"reused={len(reused)} dir={pred_dir}",
         flush=True,
     )
     return {
-        "training_run_id": training_run_id,
+        "profile_id": profile_id,
+        "profile": profile_desc,
         "predicted": predicted,
         "reused": reused,
         "skipped": skipped,
@@ -214,7 +221,8 @@ def _predict_split(
 
 def _write_manifest(
     pred_dir: str,
-    training_run_id: str,
+    profile_id: str,
+    profile_desc: dict[str, Any],
     fingerprint: str,
     prediction_k: int,
     apply_bias: bool,
@@ -225,7 +233,8 @@ def _write_manifest(
     os.makedirs(pred_dir, exist_ok=True)
     payload = {
         "created_at": utc_now(),
-        "training_run_id": training_run_id,
+        "profile_id": profile_id,
+        "profile": profile_desc,
         "fingerprint": fingerprint,
         "prediction_k": int(prediction_k),
         "apply_bias": bool(apply_bias),

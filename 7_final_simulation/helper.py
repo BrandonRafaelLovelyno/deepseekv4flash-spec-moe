@@ -4,8 +4,9 @@ The simulation replays the per-layer routing predictors trained by
 ``6_train_all`` under a mixed chunked-prefill load. This module owns everything
 two or more simulation modules need:
 
-* the config (``load_config``) and the newest-run / per-layer checkpoint
-  resolution (``resolve_run_dir`` / ``resolve_layers``);
+* the config (``load_config``) and the per-layer checkpoint resolution
+  (``resolve_profile``): one uniform run, or an explicit ``run_id -> [layer]``
+  assignment drawing each layer's checkpoint from the named run;
 * reading the contiguous cache -- source activation, target-layer truth top-k,
   selection bias and per-layer expert counts -- plus the harvest ``is_decode``
   labels the chunked-prefill streams are built from;
@@ -35,9 +36,21 @@ DISPERSALS = ("van_der_corput",)
 PREFILL_ORDERS = ("sequential_per_session",)
 CACHE_POLICIES = ("static", "cached")
 
+# The ready-recall column the verbose profile log reports per layer/distance.
+PROFILE_RECALL_METRIC = "ready_recall_r50@8"
+
 CONFIG_DEFAULTS: dict[str, Any] = {
     "seed": 0,
-    "training": {"dir": TRAINING_DIR, "run_id": None, "layers": None},
+    "training": {
+        "dir": TRAINING_DIR,
+        "run_id": None,
+        "layers": None,
+        # Explicit per-layer checkpoint assignment: ``run_id -> [layer, ...]``,
+        # drawing each listed layer's checkpoint from that exact run. ``null``
+        # keeps the historical uniform run (every layer from ``run_id``).
+        "arch": "mlp",
+        "assignments": None,
+    },
     "cache": {"dir": CACHE_DIR},
     "harvest": {"dir": HARVEST_DIR},
     "data": {"split": ["train", "test"], "datasets": None},
@@ -122,6 +135,27 @@ def load_config(config_text: str) -> dict[str, Any]:
         raise ValueError(f"simulation.prefill_order must be one of {PREFILL_ORDERS}")
     if not cfg["data"]["split"]:
         raise ValueError("data.split must name at least one split")
+
+    training = cfg["training"]
+    if not isinstance(training["arch"], str) or not training["arch"]:
+        raise ValueError("training.arch must be a non-empty string")
+    assignments = training["assignments"]
+    if assignments is not None:
+        if not isinstance(assignments, dict):
+            raise ValueError(
+                "training.assignments must be a mapping of run_id -> [layer, ...]"
+            )
+        normalized: dict[str, list[int]] = {}
+        for run_id, layers in assignments.items():
+            if not isinstance(layers, (list, tuple)) or any(
+                not isinstance(layer, int) for layer in layers
+            ):
+                raise ValueError(
+                    f"training.assignments[{run_id!r}] must be a list of layer "
+                    "indices"
+                )
+            normalized[str(run_id)] = [int(layer) for layer in layers]
+        training["assignments"] = normalized
     return cfg
 
 
@@ -276,21 +310,23 @@ def read_is_decode(path: str) -> Any:
 PREDICTIONS_SUBDIR = "predictions"
 
 
-def prediction_dir(volume_dir: str, training_run_id: str) -> str:
-    """Directory holding one training run's cached per-layer predictions."""
-    return os.path.join(volume_dir, PREDICTIONS_SUBDIR, training_run_id)
+def prediction_dir(volume_dir: str, profile_id: str) -> str:
+    """Directory holding one profile's cached per-layer predictions."""
+    return os.path.join(volume_dir, PREDICTIONS_SUBDIR, profile_id)
 
 
 def prediction_fingerprint(
-    training_run_id: str,
+    profile_id: str,
     cache_manifest: dict[str, Any],
     prediction_k: int,
     apply_bias: bool,
 ) -> str:
     """Digest of everything a cached prediction depends on.
 
-    Predictions are valid only for this ``(run, cache, prediction_k, bias)``
-    combination; a cache rebuild or a knob change therefore invalidates them.
+    ``profile_id`` identifies the checkpoint per layer (the uniform run id, or a
+    digest of the mixed layer->run map). Predictions are valid only for this
+    ``(profile, cache, prediction_k, bias)`` combination; a cache rebuild or a
+    knob change therefore invalidates them.
     """
     import hashlib
 
@@ -298,7 +334,7 @@ def prediction_fingerprint(
     digest.update(
         "|".join(
             [
-                training_run_id,
+                profile_id,
                 str(cache_manifest.get("harvest_fingerprint", "")),
                 str(int(prediction_k)),
                 str(bool(apply_bias)),
@@ -432,6 +468,212 @@ def resolve_layers(
     if not metas:
         raise ValueError(f"no checkpoints resolved under {run_dir}")
     return metas, skipped
+
+
+# --------------------------------------------------------------------------- #
+# Per-layer checkpoint assignment (explicit)
+# --------------------------------------------------------------------------- #
+def _training_runs(
+    training_dir: str, arch: str
+) -> list[tuple[str, dict[str, Any], int]]:
+    """Every completed run of ``arch`` as ``(run_id, summary, distance)``."""
+    if not os.path.isdir(training_dir):
+        raise FileNotFoundError(f"no training volume at {training_dir}")
+    runs: list[tuple[str, dict[str, Any], int, float]] = []
+    for name in os.listdir(training_dir):
+        path = os.path.join(training_dir, name, "summary.json")
+        summary = _read_json(path)
+        if summary is None:
+            continue
+        run_cfg = summary.get("config", {})
+        if run_cfg.get("model", {}).get("arch") != arch:
+            continue
+        runs.append(
+            (name, summary, int(run_cfg["task"]["distance"]), os.path.getmtime(path))
+        )
+    runs.sort(key=lambda item: item[3], reverse=True)
+    return [(name, summary, distance) for name, summary, distance, _ in runs]
+
+
+def _run_index(cfg: dict[str, Any], dims: dict[str, int]) -> dict[str, dict[str, Any]]:
+    """Index every completed arch run: ``run_id -> {distance, metas, rows}``.
+
+    ``metas`` maps layer -> checkpoint meta (from ``resolve_layers``); ``rows``
+    maps layer -> that run's summary metrics row.
+    """
+    training = cfg["training"]
+    # Index every layer a run trained, not just the requested ones, so an
+    # assignment to an unrequested layer is reported as such rather than as a
+    # missing checkpoint.
+    index_cfg = {**cfg, "training": {**training, "layers": None}}
+    index: dict[str, dict[str, Any]] = {}
+    for run_id, summary, distance in _training_runs(training["dir"], training["arch"]):
+        run_dir = os.path.join(training["dir"], run_id)
+        try:
+            metas, _ = resolve_layers(index_cfg, run_dir, summary, dims)
+        except ValueError:
+            metas = []
+        index[run_id] = {
+            "run_id": run_id,
+            "distance": distance,
+            "metas": {int(meta["layer"]): meta for meta in metas},
+            "rows": {int(row["layer"]): row for row in summary.get("layers", [])},
+        }
+    if not index:
+        raise FileNotFoundError(
+            f"no completed {training['arch']!r} runs under {training['dir']}"
+        )
+    return index
+
+
+def _profile_candidates(
+    index: dict[str, dict[str, Any]], layers: list[int]
+) -> dict[int, dict[int, float]]:
+    """Per-layer ready recall at every available distance: ``{layer: {dist: v}}``.
+
+    The value is ``PROFILE_RECALL_METRIC``, read from each run's summary row so a
+    manual assignment can be sanity-checked against the candidate distances.
+    """
+    metric = PROFILE_RECALL_METRIC
+    candidates: dict[int, dict[int, float]] = {}
+    for layer in layers:
+        scores: dict[int, float] = {}
+        for item in index.values():
+            row = item["rows"].get(layer)
+            if layer in item["metas"] and row and metric in row:
+                scores[int(item["distance"])] = float(row[metric])
+        candidates[layer] = scores
+    return candidates
+
+
+def _profile_id(profile: dict[int, dict[str, Any]]) -> str:
+    """Short digest of a mixed ``layer -> (run, distance, source)`` assignment."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    for layer in sorted(profile):
+        entry = profile[layer]
+        digest.update(
+            f"{layer}:{entry['run_id']}:{entry['distance']}:"
+            f"{entry['source_layer']};".encode()
+        )
+    return digest.hexdigest()[:16]
+
+
+Profile = tuple[
+    list[dict[str, Any]],
+    list[int],
+    dict[int, dict[str, Any]],
+    dict[int, dict[int, float]],
+]
+
+
+def _assigned_profile(
+    cfg: dict[str, Any],
+    index: dict[str, dict[str, Any]],
+) -> Profile:
+    """Resolve the explicit ``run_id -> [layer]`` assignment (strict coverage).
+
+    Every requested layer must be assigned exactly once, to a known run that
+    holds that layer's checkpoint; anything else is an error, since this mode
+    exists to pin the assignment by hand.
+    """
+    training = cfg["training"]
+    assignments = training["assignments"]
+    wanted = training["layers"]
+    requested = (
+        {int(layer) for layer in wanted}
+        if wanted
+        else {layer for item in index.values() for layer in item["metas"]}
+    )
+
+    seen: set[int] = set()
+    metas: list[dict[str, Any]] = []
+    profile: dict[int, dict[str, Any]] = {}
+    for run_id, layers in assignments.items():
+        item = index.get(str(run_id))
+        if item is None:
+            raise ValueError(
+                f"training.assignments references unknown run {run_id!r}; "
+                f"known runs: {sorted(index)}"
+            )
+        for layer in sorted({int(layer) for layer in layers}):
+            if layer in seen:
+                raise ValueError(f"layer {layer} is assigned to more than one run")
+            if layer not in item["metas"]:
+                raise ValueError(
+                    f"layer {layer} has no checkpoint in run {run_id!r}"
+                )
+            seen.add(layer)
+            meta = item["metas"][layer]
+            metas.append(meta)
+            profile[layer] = {
+                "distance": int(item["distance"]),
+                "run_id": str(run_id),
+                "source_layer": int(meta["source_layer"]),
+            }
+
+    missing = sorted(requested - seen)
+    extra = sorted(seen - requested)
+    if missing or extra:
+        raise ValueError(
+            "training.assignments must cover exactly the requested layers "
+            f"(missing {missing}, unexpected {extra})"
+        )
+    metas.sort(key=lambda meta: int(meta["layer"]))
+    candidates = _profile_candidates(index, sorted(requested))
+    return metas, [], profile, candidates
+
+
+def resolve_profile(
+    cfg: dict[str, Any], dims: dict[str, int]
+) -> tuple[list[dict[str, Any]], list[int], str, dict[str, Any]]:
+    """Resolve the per-layer checkpoints and the profile identity.
+
+    Returns ``(metas, skipped, profile_id, profile_desc)``. ``training.
+    assignments: null`` keeps the historical uniform run (``profile_id ==
+    run_id``, so old prediction caches still hit); otherwise each layer's
+    checkpoint is drawn from the run named in ``training.assignments``.
+    """
+    training = cfg["training"]
+    if training["assignments"] is None:
+        run_dir, run_id = resolve_run_dir(training["dir"], training["run_id"])
+        summary = load_run_summary(run_dir)
+        metas, skipped = resolve_layers(cfg, run_dir, summary, dims)
+        return metas, skipped, run_id, {"mode": "uniform", "run_id": run_id}
+
+    index = _run_index(cfg, dims)
+    metas, skipped, profile, candidates = _assigned_profile(cfg, index)
+    profile_id = _profile_id(profile)
+    return metas, skipped, profile_id, {
+        "mode": "mixed",
+        "label": "mixed:assigned",
+        "layers": profile,
+        "candidates": candidates,
+        "recall_metric": PROFILE_RECALL_METRIC,
+    }
+
+
+def missing_activations(
+    cache_manifest: dict[str, Any],
+    metas: list[dict[str, Any]],
+    splits: list[str],
+) -> list[str]:
+    """Cache activation entries a profile needs but the cache does not hold.
+
+    A mixed profile reads each layer's predictor at its own ``source_layer``;
+    that activation must have been laid out by some run's ``populate_cache``.
+    """
+    entries = cache_manifest.get("entries", {})
+    missing: set[str] = set()
+    for meta in metas:
+        for split in splits:
+            key = _entry_key(
+                "activation", meta["input_kind"], split, int(meta["source_layer"])
+            )
+            if key not in entries:
+                missing.add(key)
+    return sorted(missing)
 
 
 # --------------------------------------------------------------------------- #

@@ -101,6 +101,61 @@ def mirror_run(
     return out_dir
 
 
+def _int_keys(payload: dict) -> dict:
+    """Re-key a JSON round-tripped ``{str: ...}`` map back to ``{int: ...}``."""
+    return {int(key): value for key, value in payload.items()}
+
+
+def print_profile_report(profile: dict[str, Any] | None) -> None:
+    """Log the per-layer checkpoint assignment and the candidate recalls.
+
+    ``profile`` is the ``distance_profile`` payload. A mixed profile prints one
+    line per layer: the assigned run/distance/source plus the ready recall at
+    every available distance, so a hand-written assignment can be sanity-checked.
+    A uniform profile prints a single line.
+    """
+    if not profile or profile.get("mode") != "mixed":
+        run_id = (profile or {}).get("run_id", "?")
+        print(f"\n[profile] uniform: every layer from run {run_id}", flush=True)
+        return
+
+    layers = _int_keys(profile.get("layers", {}))
+    candidates = {
+        layer: _int_keys(scores)
+        for layer, scores in _int_keys(profile.get("candidates", {})).items()
+    }
+    metric = profile.get("recall_metric", "recall")
+
+    print(
+        f"\n[profile] {profile.get('label', 'mixed')}  {len(layers)} layers  "
+        f"recall={metric}",
+        flush=True,
+    )
+    by_run: dict[str, int] = {}
+    by_distance: dict[int, int] = {}
+    for layer in sorted(layers):
+        entry = layers[layer]
+        run_id = str(entry["run_id"])
+        distance = int(entry["distance"])
+        source = int(entry["source_layer"])
+        scores = candidates.get(layer, {})
+        cells = " ".join(f"d{d}={scores[d]:.3f}" for d in sorted(scores))
+        print(
+            f"[profile] L{layer:02d}  run={run_id}  d={distance}  "
+            f"src=L{source:02d}  {cells}",
+            flush=True,
+        )
+        by_run[run_id] = by_run.get(run_id, 0) + 1
+        by_distance[distance] = by_distance.get(distance, 0) + 1
+
+    runs = " | ".join(f"{run} x{count}" for run, count in sorted(by_run.items()))
+    distances = " | ".join(
+        f"d{d} x{count}" for d, count in sorted(by_distance.items())
+    )
+    print(f"[profile] runs: {runs}", flush=True)
+    print(f"[profile] distances: {distances}", flush=True)
+
+
 def print_report(run_id: str, summary: dict[str, Any], out_dir: str) -> None:
     """Print a compact run report: layers, dispersal and mean-missing highlights."""
     print(f"\nrun_id: {run_id}  training_run: {summary['training_run_id']}")
